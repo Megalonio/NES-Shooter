@@ -1359,7 +1359,9 @@
   //    to their hitbox diameter. player rotates to face aim direction —
   //    draw that sprite facing RIGHT (angle 0) in the source image.
   //  - crate is stretched to the crate's box size.
-  //  - weapons.* are ground-drop pickup icons, drawn ~28px wide.
+  //  - weaponSheet is the weapons.png sprite sheet (24x24 tiles, 1px gap,
+  //    10 cols x 4 rows) — see WEAPON_SPRITE_MAP below for the weapon-id to
+  //    column mapping. Ground-drop pickup icons are drawn 32x32.
   // ==================================================================
   const TEXTURES = {
     ground: {
@@ -1384,26 +1386,46 @@
     crate:  'textures/crate.png',
     player: 'textures/player.png',
     zombie: 'textures/zombie.png',
-    weapons: {     // ground-drop pickup icon, keyed by weapon id
-      knife:       'textures/weapons/knife.png',
-      m1911:       'textures/weapons/m1911.png',
-      glock19:     'textures/weapons/glock19.png',
-      uzi:         'textures/weapons/uzi.png',
-      ak47:        'textures/weapons/ak47.png',
-      m4a1:        'textures/weapons/m4a1.png',
-      scarh:       'textures/weapons/scarh.png',
-      mp5:         'textures/weapons/mp5.png',
-      deagle:      'textures/weapons/deagle.png',
-      beretta:     'textures/weapons/beretta.png',
-      vector:      'textures/weapons/vector.png',
-      m249:        'textures/weapons/m249.png',
-      minigun:     'textures/weapons/minigun.png',
-      barrett:     'textures/weapons/barrett.png',
-      bow:         'textures/weapons/bow.png',
-      mossberg500: 'textures/weapons/mossberg500.png',
-      benelliM4:   'textures/weapons/benelliM4.png',
-      aa12:        'textures/weapons/aa12.png'
-    }
+    // ground-drop pickup icons all come from one sprite sheet now (see
+    // WEAPON_SPRITE_MAP below for which column each weapon id uses).
+    weaponSheet: 'textures/weapons.png'
+  };
+
+  // ---- weapons.png sprite sheet layout ----
+  // 24x24 tiles, 1px gap between tiles, 10 columns x 4 rows.
+  // Row 0 (top): gun, revolver, uzi, sniper, smg/rifle(vector), rifle, smg,
+  //              shotgun, knife, axe
+  // Row 1: same weapons, color-variant "alt" skins (available for later use
+  //        — e.g. rarity-tinted drops — not wired up yet, just sliceable).
+  // Rows 2-3: unused for now.
+  const WEAPON_SPRITE_TILE = 24;
+  const WEAPON_SPRITE_GAP = 1;
+  const WEAPON_SPRITE_COLS = [
+    'gun', 'revolver', 'uzi', 'sniper', 'smgRifle', 'rifle', 'smg', 'shotgun', 'knife', 'axe'
+  ];
+  // Maps each weapon id in WEAPON_DEFS (plus the knife) to a sprite column.
+  // Several weapons share a column where the sheet doesn't have a distinct
+  // sprite for them (e.g. every pistol uses the generic "gun" column, every
+  // rifle uses "rifle"). Weapons not listed here (bow, minigun) have no
+  // matching sprite and keep falling back to the plain colored-rectangle
+  // icon drawWeaponDrops already draws when no texture is found.
+  const WEAPON_SPRITE_MAP = {
+    m1911:       'gun',
+    glock19:     'gun',
+    beretta:     'gun',
+    deagle:      'revolver',
+    uzi:         'uzi',
+    barrett:     'sniper',
+    vector:      'smgRifle',
+    ak47:        'rifle',
+    m4a1:        'rifle',
+    scarh:       'rifle',
+    m249:        'rifle',
+    mp5:         'smg',
+    mossberg500: 'shotgun',
+    benelliM4:   'shotgun',
+    aa12:        'shotgun',
+    knife:       'knife'
   };
 
   // ---- texture loader: turns the URLs above into Image objects and tracks
@@ -1425,6 +1447,32 @@
     entry.img.onerror = ()=>{ console.warn('[TEXTURES] failed to load', key, url); };
     entry.img.src = url;
     TEX_CACHE[key] = entry;
+  }
+
+  // Slices one 24x24 tile out of the weapons sprite sheet (accounting for
+  // the 1px gap between tiles) and caches the crop as its own small canvas,
+  // same pattern as getTileImg — so we crop the sheet once per weapon
+  // rather than re-cropping it every frame.
+  const WEAPON_SPRITE_CACHE = {};
+  function getWeaponSpriteTex(weaponId, row){
+    row = row || 0;
+    const col = WEAPON_SPRITE_MAP[weaponId];
+    if(!col) return null;
+    const colIdx = WEAPON_SPRITE_COLS.indexOf(col);
+    if(colIdx < 0) return null;
+    const cacheKey = weaponId + '@row' + row;
+    if(WEAPON_SPRITE_CACHE[cacheKey]) return WEAPON_SPRITE_CACHE[cacheKey];
+    const sheet = getTex('weaponSheet');
+    if(!sheet) return null;
+    const sx = colIdx * (WEAPON_SPRITE_TILE + WEAPON_SPRITE_GAP);
+    const sy = row * (WEAPON_SPRITE_TILE + WEAPON_SPRITE_GAP);
+    const c = document.createElement('canvas');
+    c.width = WEAPON_SPRITE_TILE; c.height = WEAPON_SPRITE_TILE;
+    const cctx = c.getContext('2d');
+    cctx.imageSmoothingEnabled = false;
+    cctx.drawImage(sheet, sx, sy, WEAPON_SPRITE_TILE, WEAPON_SPRITE_TILE, 0, 0, WEAPON_SPRITE_TILE, WEAPON_SPRITE_TILE);
+    WEAPON_SPRITE_CACHE[cacheKey] = c;
+    return c;
   }
 
   // ---------------- NES-ified pixel art (no fetching, no network, no CORS) ----------------
@@ -1855,7 +1903,7 @@
   loadTex('crate',        TEXTURES.crate);
   loadTex('player',       TEXTURES.player);
   loadTex('zombie',       TEXTURES.zombie);
-  for(const wid in TEXTURES.weapons){ loadTex('weapon.'+wid, TEXTURES.weapons[wid]); }
+  loadTex('weaponSheet', TEXTURES.weaponSheet);
 
   // ---------------- Character animation: idle/walk only ----------------
   // Survivors (the player) are drawn as a random pick from every non-orc
@@ -3343,9 +3391,13 @@
     codes[e.code] = true;
     // 'i' used to open the old crate-storage/backpack inventory — that UI
     // is gone now (crates are shot/knifed open instead), so it's free/unbound.
-    if(e.key==='1') selectSlot('main');
-    if(e.key==='2') selectSlot('sidearm');
-    if(e.key==='3') performQuickKnife();                // quick knife — stabs where you're moving, doesn't touch what's in hand
+    // Physical top-row digit keys — e.code is layout-independent, so this
+    // fires correctly even on AZERTY, where the physical '1'/'2'/'3' keys
+    // type '&'/'é'/'"' rather than digits. Numpad digits work the same way
+    // already (Numpad1/2/3 always report as digits) so both rows work.
+    if(e.code==='Digit1'||e.code==='Numpad1') selectSlot('main');
+    if(e.code==='Digit2'||e.code==='Numpad2') selectSlot('sidearm');
+    if(e.code==='Digit3'||e.code==='Numpad3') performQuickKnife();  // quick knife — stabs where you're moving, doesn't touch what's in hand
     if(e.key==='e' || e.key==='E') tryInteract();       // pick up floor item
     // Quick knife on the physical top-left letter key — e.code is the
     // physical key location, independent of what character it types, so
@@ -3370,6 +3422,21 @@
   });
   canvas.addEventListener('mousedown', e=>{ mouse.down = true; mouse.active = true; requestGameFullscreen(); resumeAudio(); });
   window.addEventListener('mouseup', e=>{ mouse.down = false; });
+
+  // Mouse wheel also cycles weapons (main <-> sidearm, or through dual if
+  // eligible) — same effect as the Q-equivalent SWAP action. preventDefault
+  // stops the page itself from scrolling while playing. Only two/three
+  // slots exist in the cycle, so direction doesn't need to matter — any
+  // wheel tick just advances to the next slot.
+  let lastWheelCycle = 0;
+  canvas.addEventListener('wheel', e=>{
+    e.preventDefault();
+    const now = performance.now();
+    if(now - lastWheelCycle < 150) return; // debounce high-precision trackpads/wheels
+    lastWheelCycle = now;
+    resumeAudio();
+    cycleWeapon();
+  }, { passive:false });
 
   // ---------------- Touch joysticks ----------------
   const stickLeft = document.getElementById('stickLeft');
@@ -4614,13 +4681,11 @@
         ctx.fillText('INTERACT', d.x, d.y + WEAPON_PICKUP_R + 11);
       }
 
-      const weaponTex = getTex('weapon.'+d.def.id);
+      const weaponTex = getWeaponSpriteTex(d.def.id);
       if(weaponTex){
-        // preserves the image's own aspect ratio instead of squashing it
-        // into the old 28x10 rectangle — fit within a 32px box
-        const iw = weaponTex.naturalWidth||1, ih = weaponTex.naturalHeight||1;
-        const scale = Math.min(32/iw, 32/ih);
-        const dw = iw*scale, dh = ih*scale;
+        // sprite tiles are a fixed 24x24 square — draw at a fixed 32px box
+        // to match the old icon's on-screen size.
+        const dw = 32, dh = 32;
         ctx.drawImage(weaponTex, d.x-dw/2, d.y-dh/2, dw, dh);
       } else {
         ctx.fillStyle = d.def.color;
