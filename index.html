@@ -3344,8 +3344,11 @@
     if(e.key==='1') selectSlot('main');
     if(e.key==='2') selectSlot('sidearm');
     if(e.key==='3') performQuickKnife();                // quick knife — stabs where you're moving, doesn't touch what's in hand
-    if(e.key==='f' || e.key==='F') tryInteract();      // pick up floor item
-    if(e.key==='q' || e.key==='Q') cycleWeapon();       // switch weapon (desktop equivalent of the SWAP button)
+    if(e.key==='e' || e.key==='E') tryInteract();       // pick up floor item
+    // Knife equip on A or Q — these double as move-left on QWERTY/AZERTY,
+    // so guard with e.repeat to only fire once per physical press, not on
+    // every repeat event while the key is held down to walk.
+    if(!e.repeat && (e.key==='a' || e.key==='A' || e.key==='q' || e.key==='Q')) selectSlot('knife');
   });
   window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
 
