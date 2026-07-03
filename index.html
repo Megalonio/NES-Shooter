@@ -246,7 +246,7 @@
   <button id="crtToggleBtn" type="button" aria-pressed="true">
     <span class="dot"></span><span id="crtToggleLabel">CRT: On</span>
   </button>
-  <input type="range" id="crtCurveSlider" min="0" max="30" value="10" title="TV curvature depth" style="accent-color:var(--amber); vertical-align:middle;">
+  <input type="range" id="crtCurveSlider" min="0" max="30" value="30" title="TV curvature depth" style="accent-color:var(--amber); vertical-align:middle;">
   <button id="resToggleBtn" type="button" title="Switches between native SNES resolution and hi-res mode. Reloads to apply.">
     <span id="resToggleLabel">Res: SNES Hi-Res</span>
   </button>
@@ -315,7 +315,7 @@
   // console — switching any of them means a reset.
   const RES_STORAGE_KEY = 'perimeter_resMode';   // 'normal' | 'hires'
   const STD_STORAGE_KEY = 'perimeter_tvStandard'; // 'ntsc' | 'pal'
-  let resMode = 'hires';
+  let resMode = 'normal';
   let tvStandard = 'ntsc';
   try{
     const savedRes = localStorage.getItem(RES_STORAGE_KEY);
@@ -388,7 +388,7 @@
   // unaffected — turning your own fog off doesn't make enemies see through
   // walls or blind to you.
   const FOG_STORAGE_KEY = 'perimeter_fogOfWarEnabled';
-  let fogOfWarEnabled = true;
+  let fogOfWarEnabled = false;
   try{
     const saved = localStorage.getItem(FOG_STORAGE_KEY);
     if(saved !== null) fogOfWarEnabled = saved === '1';
@@ -643,7 +643,7 @@
     gl.viewport(0, 0, crtCanvas.width, crtCanvas.height);
   }
 
-  let crtCurvature = 0.10;
+  let crtCurvature = 0.30;
   const crtCurveSlider = document.getElementById('crtCurveSlider');
   if(crtCurveSlider) crtCurveSlider.addEventListener('input', ()=>{ crtCurvature = crtCurveSlider.value/100; });
 
@@ -3336,21 +3336,27 @@
 
   // ---------------- Input state ----------------
   const keys = {};
+  const codes = {}; // physical key-code state (layout-independent), used for movement
   window.addEventListener('keydown', e=>{
     resumeAudio();
     keys[e.key.toLowerCase()] = true;
+    codes[e.code] = true;
     // 'i' used to open the old crate-storage/backpack inventory — that UI
     // is gone now (crates are shot/knifed open instead), so it's free/unbound.
     if(e.key==='1') selectSlot('main');
     if(e.key==='2') selectSlot('sidearm');
     if(e.key==='3') performQuickKnife();                // quick knife — stabs where you're moving, doesn't touch what's in hand
     if(e.key==='e' || e.key==='E') tryInteract();       // pick up floor item
-    // Knife equip on A or Q — these double as move-left on QWERTY/AZERTY,
-    // so guard with e.repeat to only fire once per physical press, not on
-    // every repeat event while the key is held down to walk.
-    if(!e.repeat && (e.key==='a' || e.key==='A' || e.key==='q' || e.key==='Q')) selectSlot('knife');
+    // Quick knife on the physical top-left letter key — e.code is the
+    // physical key location, independent of what character it types, so
+    // this is 'Q' on a QWERTY keyboard and 'A' on an AZERTY keyboard
+    // without needing to actually detect the layout. That physical key is
+    // never part of WASD (QWERTY) or ZQSD (AZERTY) movement in either
+    // layout — see the movement check below, which is keyed the same
+    // layout-independent way — so it can't collide with moving left.
+    if(e.code === 'KeyQ') performQuickKnife();
   });
-  window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+  window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; codes[e.code] = false; });
 
   let mouse = {x: player.x+50, y: player.y, down:false, active:false};
   canvas.addEventListener('mousemove', e=>{
@@ -3882,10 +3888,13 @@
 
     // ---- movement input ----
     let mx=0, my=0;
-    if(keys['w']||keys['z']||keys['arrowup']) my-=1;
-    if(keys['s']||keys['arrowdown']) my+=1;
-    if(keys['a']||keys['q']||keys['arrowleft']) mx-=1;
-    if(keys['d']||keys['arrowright']) mx+=1;
+    // Physical WASD positions — code is layout-independent, so this is
+    // W/A/S/D on a QWERTY board and Z/Q/S/D on an AZERTY board (same keys,
+    // physically), without needing to detect which layout the player has.
+    if(codes['KeyW']||keys['arrowup']) my-=1;
+    if(codes['KeyS']||keys['arrowdown']) my+=1;
+    if(codes['KeyA']||keys['arrowleft']) mx-=1;
+    if(codes['KeyD']||keys['arrowright']) mx+=1;
     if(moveTouch.active){
       const mmag = Math.hypot(moveTouch.dx, moveTouch.dy);
       const MOVE_DEADZONE = 0.15;
