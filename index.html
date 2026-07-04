@@ -835,6 +835,12 @@
       return true;
     }
 
+    // Houses are now small overworld footprints (a wall block plus one door
+    // tile) instead of full walk-in buildings — the actual rooms live in a
+    // separate instanced interior, generated lazily the first time the door
+    // gets stepped on (see buildHouseInterior/enterHouse further down,
+    // outside this generator). A lot more of these small footprints fit in
+    // the same village space than the old multi-room buildings did.
     const HOUSE_PAD = 2; // min tile gap kept between houses
     const houses = [];
     // No fixed house count — keep rolling placements until enough attempts
@@ -845,7 +851,7 @@
     while(consecutiveFails < 60){
       let placed = false;
       for(let attempt=0; attempt<40; attempt++){
-        const w = randInt(12,18), h = randInt(10,14);
+        const w = randInt(4,6), h = randInt(3,5);
         const x = randInt(landX0, landX1-w+1), y = randInt(landY0, landY1-h+1);
         if(!footprintIsBiome(x,y,w,h,'village')) continue;
         const cand = {x,y,w,h};
@@ -859,147 +865,51 @@
     }
     if(houses.length===0){
       const villageSeed = seeds.find(s=>s.type==='village');
-      const fw=14, fh=12;
+      const fw=5, fh=4;
       const fx = Math.max(landX0, Math.min(landX1-fw+1, villageSeed.x-Math.floor(fw/2)));
       const fy = Math.max(landY0, Math.min(landY1-fh+1, villageSeed.y-Math.floor(fh/2)));
       houses.push({x:fx, y:fy, w:fw, h:fh});
     }
 
-    // ---- 2. subdivide each footprint into rooms (BSP), tag, connect, door it ----
-    const MIN_ROOM = 3; // smallest allowed room dimension — keeps the bathroom small but usable
-    function buildHouse(house){
+    // ---- 2. exterior footprint only: solid block + one door tile ----
+    // The actual rooms no longer live on the overworld grid at all — this
+    // just carves the little building-shaped obstacle you see while
+    // walking around, plus a single 'D' door tile somewhere on its
+    // perimeter that the outer game code wires up as an enter/exit
+    // trigger (see buildHouseInterior/enterHouse/exitHouse, defined outside
+    // this generator once TILE/W/H are in scope). The door always sits next
+    // to a tile that's still open ground once every house/biome edit above
+    // has finished, so stepping out of it never drops the player into a
+    // wall or water.
+    function buildHouseExterior(house){
       fillRect(house.x, house.y, house.w, house.h, '#');
-      fillRect(house.x+1, house.y+1, house.w-2, house.h-2, '.');
-      const interior = {x:house.x+1, y:house.y+1, w:house.w-2, h:house.h-2};
-
-      // Repeatedly split the largest splittable region in two, carving a wall
-      // between the halves. Doors are NOT carved yet — a later split of one
-      // of the halves can plant its own wall right where an early door would
-      // have opened (a T-junction), sealing it into a dead end. So instead
-      // every split is recorded as a pending "edge" and all doors get carved
-      // in a second pass once every wall in the house is finished, checking
-      // that both sides of the chosen door spot are still open floor.
-      // Because every split's edge connects exactly the two halves it just
-      // made, the whole tree of rooms ends up as a spanning tree — every
-      // room is reachable from every other room by construction. Some splits
-      // land as a long sliver that reads as a hallway, others as two rooms
-      // opening straight into each other — which one you get is random per
-      // split, so a house can end up mixing both within itself.
-      let regions = [interior];
-      const edges = []; // {axis:'v'|'h', coord, start, end} — wall line to punch a door through later
-      const targetLeaves = randInt(4,6);
-      let guard = 0;
-      while(regions.length < targetLeaves && guard++ < 40){
-        regions.sort((a,b)=> (b.w*b.h)-(a.w*a.h));
-        const canSplit = r => r.w >= MIN_ROOM*2+1 || r.h >= MIN_ROOM*2+1;
-        const idx = regions.findIndex(canSplit);
-        if(idx === -1) break;
-        const region = regions.splice(idx,1)[0];
-        const canV = region.w >= MIN_ROOM*2+1, canH = region.h >= MIN_ROOM*2+1;
-        const vertical = canV && canH ? (region.w >= region.h ? rng()<0.6 : rng()<0.4) : canV;
-        if(vertical){
-          const splitPos = randInt(MIN_ROOM, region.w-MIN_ROOM-1);
-          const wallX = region.x + splitPos;
-          for(let r=region.y; r<region.y+region.h; r++) grid[r][wallX]='#';
-          edges.push({axis:'v', coord:wallX, start:region.y, end:region.y+region.h-1});
-          regions.push({x:region.x, y:region.y, w:splitPos, h:region.h});
-          regions.push({x:wallX+1, y:region.y, w:region.w-splitPos-1, h:region.h});
-        } else {
-          const splitPos = randInt(MIN_ROOM, region.h-MIN_ROOM-1);
-          const wallY = region.y + splitPos;
-          for(let c=region.x; c<region.x+region.w; c++) grid[wallY][c]='#';
-          edges.push({axis:'h', coord:wallY, start:region.x, end:region.x+region.w-1});
-          regions.push({x:region.x, y:region.y, w:region.w, h:splitPos});
-          regions.push({x:region.x, y:wallY+1, w:region.w, h:region.h-splitPos-1});
-        }
+      const sides = ['north','south','east','west'];
+      for(let i=sides.length-1;i>0;i--){ const j=Math.floor(rng()*(i+1)); const tmp=sides[i]; sides[i]=sides[j]; sides[j]=tmp; }
+      let chosen = null;
+      for(const side of sides){
+        let dCol, dRow, oCol, oRow;
+        if(side==='north'){ dCol=randInt(house.x, house.x+house.w-1); dRow=house.y; oCol=dCol; oRow=house.y-1; }
+        else if(side==='south'){ dCol=randInt(house.x, house.x+house.w-1); dRow=house.y+house.h-1; oCol=dCol; oRow=house.y+house.h; }
+        else if(side==='west'){ dRow=randInt(house.y, house.y+house.h-1); dCol=house.x; oCol=house.x-1; oRow=dRow; }
+        else { dRow=randInt(house.y, house.y+house.h-1); dCol=house.x+house.w-1; oCol=house.x+house.w; oRow=dRow; }
+        if(oRow<0||oRow>=ROWS||oCol<0||oCol>=COLS) continue;
+        if(grid[oRow][oCol] === '.'){ chosen = {side,dCol,dRow,oCol,oRow}; break; }
       }
-
-      // Second pass: now that every internal wall in the house is in its
-      // final place, punch one door through each recorded wall line, only at
-      // a spot where both sides are actually open floor (skips T-junctions
-      // where a later split's wall crosses right at that point).
-      for(const e of edges){
-        const candidates = [];
-        for(let p=e.start+1; p<=e.end-1; p++){
-          if(e.axis==='v'){
-            if(grid[p][e.coord-1]!=='#' && grid[p][e.coord+1]!=='#') candidates.push(p);
-          } else {
-            if(grid[e.coord-1][p]!=='#' && grid[e.coord+1][p]!=='#') candidates.push(p);
-          }
-        }
-        // fall back to the wall's full range if the interior-only scan found nothing
-        if(candidates.length===0){
-          for(let p=e.start; p<=e.end; p++){
-            if(e.axis==='v'){
-              if(grid[p][e.coord-1]!=='#' && grid[p][e.coord+1]!=='#') candidates.push(p);
-            } else {
-              if(grid[e.coord-1][p]!=='#' && grid[e.coord+1][p]!=='#') candidates.push(p);
-            }
-          }
-        }
-        if(candidates.length){
-          const p = pick(candidates);
-          if(e.axis==='v') grid[p][e.coord]='.'; else grid[e.coord][p]='.';
-        }
+      if(!chosen){
+        // dense village center fallback — force a south door regardless of
+        // what's out there, and make sure that spot is at least walkable.
+        const dCol = house.x+Math.floor(house.w/2), dRow = house.y+house.h-1;
+        const oRow = Math.min(ROWS-1, dRow+1), oCol = dCol;
+        grid[oRow][oCol] = '.';
+        chosen = {side:'south', dCol, dRow, oCol, oRow};
       }
-
-      // Tag rooms: smallest -> bathroom (small-size bias), next -> kitchen,
-      // largest -> living room, everything left over -> bedroom(s).
-      const rooms = regions.map(r=>({...r, area:r.w*r.h}));
-      rooms.sort((a,b)=> a.area-b.area);
-      rooms.forEach((r,i)=>{
-        if(i===0) r.type='bathroom';
-        else if(i===rooms.length-1) r.type='living';
-        else if(i===1) r.type='kitchen';
-        else r.type='bedroom';
-      });
-      if(rooms.length===1) rooms[0].type='living';
-      if(rooms.length>=2 && !rooms.some(r=>r.type==='kitchen')) rooms[1].type='kitchen';
-
-      // Front door: on an exterior wall, in a room that actually touches
-      // that wall — biased toward the living room as the natural entryway.
-      const boundary = rooms.filter(r=>
-        r.x===interior.x || r.x+r.w===interior.x+interior.w ||
-        r.y===interior.y || r.y+r.h===interior.y+interior.h
-      );
-      const doorRoom = boundary.find(r=>r.type==='living') || pick(boundary.length?boundary:rooms);
-      const sides = [];
-      if(doorRoom.x===interior.x) sides.push('west');
-      if(doorRoom.x+doorRoom.w===interior.x+interior.w) sides.push('east');
-      if(doorRoom.y===interior.y) sides.push('north');
-      if(doorRoom.y+doorRoom.h===interior.y+interior.h) sides.push('south');
-      switch(pick(sides)){
-        case 'west':  grid[randInt(doorRoom.y+1, Math.max(doorRoom.y+1, doorRoom.y+doorRoom.h-2))][house.x] = '.'; break;
-        case 'east':  grid[randInt(doorRoom.y+1, Math.max(doorRoom.y+1, doorRoom.y+doorRoom.h-2))][house.x+house.w-1] = '.'; break;
-        case 'north': grid[house.y][randInt(doorRoom.x+1, Math.max(doorRoom.x+1, doorRoom.x+doorRoom.w-2))] = '.'; break;
-        default:      grid[house.y+house.h-1][randInt(doorRoom.x+1, Math.max(doorRoom.x+1, doorRoom.x+doorRoom.w-2))] = '.'; break;
-      }
-
-      // Windows: one per exterior-facing room, on a side that isn't already
-      // the front door. 'V' is its own tile — glass blocks movement until
-      // shot or struck out, but never blocks sight (see rendering/collision
-      // below), so you can see through an intact window from the start.
-      for(const r of boundary){
-        if(rng() > 0.7) continue; // not every room gets one
-        const sidesHere = [];
-        if(r.x===interior.x) sidesHere.push('west');
-        if(r.x+r.w===interior.x+interior.w) sidesHere.push('east');
-        if(r.y===interior.y) sidesHere.push('north');
-        if(r.y+r.h===interior.y+interior.h) sidesHere.push('south');
-        if(!sidesHere.length) continue;
-        let wx, wy;
-        switch(pick(sidesHere)){
-          case 'west':  wy = randInt(r.y+1, Math.max(r.y+1, r.y+r.h-2)); wx = house.x; break;
-          case 'east':  wy = randInt(r.y+1, Math.max(r.y+1, r.y+r.h-2)); wx = house.x+house.w-1; break;
-          case 'north': wx = randInt(r.x+1, Math.max(r.x+1, r.x+r.w-2)); wy = house.y; break;
-          default:      wx = randInt(r.x+1, Math.max(r.x+1, r.x+r.w-2)); wy = house.y+house.h-1; break;
-        }
-        if(grid[wy][wx] === '#') grid[wy][wx] = 'V'; // skip if the front door already took this exact spot
-      }
-
-      return {house, rooms};
+      grid[chosen.dRow][chosen.dCol] = 'D';
+      house.doorCol = chosen.dCol; house.doorRow = chosen.dRow;
+      house.standCol = chosen.oCol; house.standRow = chosen.oRow;
+      house.side = chosen.side;
+      return house;
     }
-    const builtHouses = houses.map(buildHouse);
+    const builtHouses = houses.map(buildHouseExterior);
 
     // ---- 3b. FOREST: scatter single-tile tree trunks across the
     // forest-tagged ground — no canopy, just the trunk tile, so each tree
@@ -1044,65 +954,15 @@
     }
     generateVillageMap.lastForestFloor = forestFloorTiles;
 
-    // ---- 4. spawns: one crate AND one enemy in every house, player in a
-    // (different) house ----
-    // Each role prefers a house nobody else has been placed in yet, falling
-    // back to reusing one if the village didn't roll enough houses.
-    const usedHouses = [];
-    function pickRoleHouse(){
-      const pool = builtHouses.filter(h=>!usedHouses.includes(h));
-      const h = pick(pool.length ? pool : builtHouses);
-      usedHouses.push(h);
-      return h;
-    }
-    function placeInHouse(house, tileChar){
-      const room = pick(house.rooms);
-      let row = randInt(room.y, room.y+room.h-1), col = randInt(room.x, room.x+room.w-1);
-      if(grid[row][col] !== '.'){
-        outer: for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
-          const r=row+dr, c=col+dc;
-          if(r>0&&r<ROWS-1&&c>0&&c<COLS-1&&grid[r][c]==='.'){ row=r; col=c; break outer; }
-        }
-      }
-      grid[row][col] = tileChar;
-      return {row, col};
-    }
-
-    // Every house gets exactly two crates, each dropped in a random
-    // non-bathroom room (falling back to any room if the house has no other
-    // kind). The two crates are placed independently, so they can land in
-    // different rooms or the same one — the neighbor-search fallback below
-    // already keeps a second crate from overwriting the first tile.
-    for(const built of builtHouses){
-      for(let n=0; n<2; n++){
-        const roomPool = built.rooms.filter(r=>r.type!=='bathroom');
-        const room = pick(roomPool.length ? roomPool : built.rooms);
-        let row = randInt(room.y, room.y+room.h-1), col = randInt(room.x, room.x+room.w-1);
-        if(grid[row][col] !== '.'){
-          outer: for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
-            const r=row+dr, c=col+dc;
-            if(r>0&&r<ROWS-1&&c>0&&c<COLS-1&&grid[r][c]==='.'){ row=r; col=c; break outer; }
-          }
-        }
-        if(grid[row][col] === '.') grid[row][col] = 'C';
-      }
-    }
-
-    // And every house also gets exactly one enemy, same random-room approach,
-    // independent of (and possibly stacked on) the crate tile above.
-    for(const built of builtHouses){
-      const room = pick(built.rooms);
-      let row = randInt(room.y, room.y+room.h-1), col = randInt(room.x, room.x+room.w-1);
-      if(grid[row][col] !== '.'){
-        outer: for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
-          const r=row+dr, c=col+dc;
-          if(r>0&&r<ROWS-1&&c>0&&c<COLS-1&&grid[r][c]==='.'){ row=r; col=c; break outer; }
-        }
-      }
-      grid[row][col] = 'E';
-    }
-
-    const playerTile = placeInHouse(pickRoleHouse(), 'P');
+    // ---- 4. player start: just outside a random house's door ----
+    // Crates and enemies used to be placed here too, one set baked directly
+    // into every house's rooms. Now that a house's rooms don't exist until
+    // its door is actually used (see buildHouseInterior/enterHouse below),
+    // that loot/enemy placement happens per-interior instead, the first
+    // time each house is entered.
+    const startHouse = pick(builtHouses);
+    grid[startHouse.standRow][startHouse.standCol] = 'P';
+    const playerTile = {row: startHouse.standRow, col: startHouse.standCol};
 
     // ---- 5. connectivity check: flood-fill from the player spawn and make
     // sure every walkable tile (open ground + every room in every house) got
@@ -1137,9 +997,163 @@
   }
 
   const MAP = generateVillageMap();
-  const HOUSES = generateVillageMap.lastHouses; // tile-coord rects {x,y,w,h}
+
+  // ---- House interiors: a reserved, sector-aligned "stage" appended below
+  // the real map ----
+  // Houses on the overworld are just small footprints with a single door
+  // tile now (see buildHouseExterior above) — stepping onto that door
+  // doesn't reveal a building already sitting on the map, it teleports the
+  // player onto this shared stage instead, freshly stamped with that
+  // house's own (lazily generated, then cached) interior layout. Because
+  // the camera is already a flip-screen scroller locked to whichever
+  // W×H-px sector the player stands in (see screenScroller below), giving
+  // the stage exactly one sector's worth of tiles — padded up to the next
+  // full sector row so it can't straddle two sectors — means the interior
+  // just IS the whole screen with zero extra camera work: no scrolling
+  // happens inside it, because the player physically can't leave that one
+  // sector except through the door, which is handled as an explicit
+  // teleport (see enterHouse/exitHouse) rather than a normal screen edge
+  // crossing.
+  const SECTOR_TILES_X = Math.floor(W/TILE), SECTOR_TILES_Y = Math.floor(H/TILE);
+  const REAL_ROWS = MAP.length, REAL_COLS = MAP[0].length;
+  const STAGE_PAD = (SECTOR_TILES_Y - (REAL_ROWS % SECTOR_TILES_Y)) % SECTOR_TILES_Y;
+  const INTERIOR_ROW0 = REAL_ROWS + STAGE_PAD; // first row of the stage, always a multiple of SECTOR_TILES_Y
+  for(let i=0;i<STAGE_PAD;i++) MAP.push('#'.repeat(REAL_COLS));
+  for(let i=0;i<SECTOR_TILES_Y;i++) MAP.push('#'.repeat(Math.max(REAL_COLS, SECTOR_TILES_X)));
+
+  const VILLAGE_HOUSES = generateVillageMap.lastHouses; // per-house metadata: {x,y,w,h,doorCol,doorRow,standCol,standRow,side,interior}
+  const HOUSES = VILLAGE_HOUSES.concat([{x:0, y:INTERIOR_ROW0, w:SECTOR_TILES_X, h:SECTOR_TILES_Y}]); // tile-coord rects — the stage always reads as "inside a house" for flooring/footstep purposes, whether or not it's currently occupied
+  const HOUSE_DOOR_LOOKUP = new Map(VILLAGE_HOUSES.map(h => [h.doorRow+','+h.doorCol, h])); // world door-tile coords -> house, for the enter-house check in update()
+  const houseStandTiles = VILLAGE_HOUSES.map(h => ({x: h.standCol*TILE+TILE/2, y: h.standRow*TILE+TILE/2})); // one safe outdoor spot per house — player/enemy spawns and respawns are picked from this list now that house interiors aren't part of the overworld grid
   const FOREST_FLOOR = (generateVillageMap.lastForestFloor || []).map(t => ({x: t.c*TILE+TILE/2, y: t.r*TILE+TILE/2})); // walkable forest-biome ground — zombies spawn/respawn anywhere in this pool
   const FOREST_TREE_COUNT = generateVillageMap.lastTreeCount || 0;
+
+  // ---- buildHouseInterior: generates ONE house's interior layout, sized to
+  // exactly fill the stage (SECTOR_TILES_X × SECTOR_TILES_Y) ----
+  // BSP-split into a handful of rooms same as the old per-house generator
+  // used to do, but this time the rooms don't just open directly into each
+  // other through a shared wall — each split's two halves get a real 1-tile
+  // corridor carved between their room centers (an L-shaped dogleg, carved
+  // horizontal-then-vertical or vertical-then-horizontal at random), so the
+  // house actually has hallways now. A single door is carved from a random
+  // edge of the stage inward to whichever room sits closest to that edge.
+  // Called lazily the first time a house's door is used (see enterHouse) and
+  // cached on the house object afterward, so re-entering later shows the
+  // same layout with whatever's already been looted/killed still gone.
+  const INTERIOR_MIN_LEAF = 4; // smallest splittable region, in the 1-tile-inset playable area
+  function buildHouseInterior(house){
+    const playW = SECTOR_TILES_X-2, playH = SECTOR_TILES_Y-2; // inside the permanent 1-tile border wall
+    const local = []; // playW×playH working grid, local coords (0,0) = one tile in from the stage's NW corner
+    for(let y=0;y<playH;y++) local.push(new Array(playW).fill('#'));
+    function setFloor(x,y){ if(x>=0&&x<playW&&y>=0&&y<playH) local[y][x]='.'; }
+
+    const rooms = [];
+    const corridors = []; // {from:room, to:room} — one per split, connecting a representative room from each half
+    function carveRoom(region){
+      const rw = Math.max(2, Math.min(region.w-2, randInt(2, region.w-2)));
+      const rh = Math.max(2, Math.min(region.h-2, randInt(2, region.h-2)));
+      const rx = region.x + randInt(1, Math.max(1, region.w-rw-1));
+      const ry = region.y + randInt(1, Math.max(1, region.h-rh-1));
+      for(let y=ry;y<ry+rh;y++) for(let x=rx;x<rx+rw;x++) setFloor(x,y);
+      const room = {x:rx,y:ry,w:rw,h:rh, cx:Math.floor(rx+rw/2), cy:Math.floor(ry+rh/2)};
+      rooms.push(room);
+      return room;
+    }
+    function buildBSP(region, depthLeft){
+      const canV = region.w >= INTERIOR_MIN_LEAF*2, canH = region.h >= INTERIOR_MIN_LEAF*2;
+      if(depthLeft<=0 || (!canV && !canH)) return carveRoom(region);
+      const vertical = canV && canH ? rng()<0.5 : canV;
+      let a, b;
+      if(vertical){
+        const cut = randInt(INTERIOR_MIN_LEAF, region.w-INTERIOR_MIN_LEAF);
+        a = {x:region.x, y:region.y, w:cut, h:region.h};
+        b = {x:region.x+cut, y:region.y, w:region.w-cut, h:region.h};
+      } else {
+        const cut = randInt(INTERIOR_MIN_LEAF, region.h-INTERIOR_MIN_LEAF);
+        a = {x:region.x, y:region.y, w:region.w, h:cut};
+        b = {x:region.x, y:region.y+cut, w:region.w, h:region.h-cut};
+      }
+      const ra = buildBSP(a, depthLeft-1), rb = buildBSP(b, depthLeft-1);
+      corridors.push({from:ra, to:rb});
+      return pick([ra, rb]);
+    }
+    buildBSP({x:0,y:0,w:playW,h:playH}, 2); // depth 2 -> 2-4 rooms, matched to the stage's small size
+
+    // Carve every corridor: horizontal-then-vertical or vertical-then-
+    // horizontal dogleg between the two rooms' centers, picked per-corridor
+    // for variety. Occasionally clips through an unrelated room it passes
+    // near — normal for this style of BSP dungeon and harmless, just reads
+    // as an extra connection.
+    for(const c of corridors){
+      let x=c.from.cx, y=c.from.cy;
+      const tx=c.to.cx, ty=c.to.cy;
+      if(rng()<0.5){
+        while(x!==tx){ setFloor(x,y); x += x<tx?1:-1; }
+        while(y!==ty){ setFloor(x,y); y += y<ty?1:-1; }
+      } else {
+        while(y!==ty){ setFloor(x,y); y += y<ty?1:-1; }
+        while(x!==tx){ setFloor(x,y); x += x<tx?1:-1; }
+      }
+      setFloor(tx,ty);
+    }
+
+    // Door: pick a random side of the stage, carve a straight stub from
+    // that edge in to whichever room sits closest to it.
+    const doorSide = pick(['north','south','east','west']);
+    function edgeDist(r){
+      if(doorSide==='north') return r.cy;
+      if(doorSide==='south') return (playH-1)-r.cy;
+      if(doorSide==='west')  return r.cx;
+      return (playW-1)-r.cx;
+    }
+    const anchor = rooms.slice().sort((a,b)=>edgeDist(a)-edgeDist(b))[0];
+    // Door coords are in STAGE (global) space — it sits ON the permanent
+    // border ring, one step past the local playable grid the stub below is
+    // carved through (local (x,y) -> global (x+1, y+1)).
+    let doorLocalCol, doorLocalRow;
+    if(doorSide==='north'){
+      doorLocalCol = anchor.cx+1; doorLocalRow = 0;
+      for(let y=0;y<=anchor.cy;y++) setFloor(anchor.cx,y);
+    } else if(doorSide==='south'){
+      doorLocalCol = anchor.cx+1; doorLocalRow = SECTOR_TILES_Y-1;
+      for(let y=playH-1;y>=anchor.cy;y--) setFloor(anchor.cx,y);
+    } else if(doorSide==='west'){
+      doorLocalRow = anchor.cy+1; doorLocalCol = 0;
+      for(let x=0;x<=anchor.cx;x++) setFloor(x,anchor.cy);
+    } else {
+      doorLocalRow = anchor.cy+1; doorLocalCol = SECTOR_TILES_X-1;
+      for(let x=playW-1;x>=anchor.cx;x--) setFloor(x,anchor.cy);
+    }
+
+    // A couple of crates and a light scattering of enemies, one room-visit
+    // each — interiors are small now, so this is deliberately lighter than
+    // the old two-crates-plus-one-enemy-per-house baseline.
+    const crateCount = Math.min(rooms.length, randInt(1,2));
+    const crateRooms = rooms.slice();
+    for(let i=crateRooms.length-1;i>0;i--){ const j=Math.floor(rng()*(i+1)); const tmp=crateRooms[i]; crateRooms[i]=crateRooms[j]; crateRooms[j]=tmp; }
+    const crates = crateRooms.slice(0,crateCount).map(r=>({col:r.cx+1, row:r.cy+1, alive:true}));
+    const enemyCount = Math.max(1, Math.round(rooms.length/2));
+    const enemies = [];
+    for(let i=0;i<enemyCount;i++){
+      const r = pick(rooms);
+      enemies.push({col:r.cx+1, row:r.cy+1, alive:true});
+    }
+
+    // Stamp the border wall + local grid into full stage-sized row strings
+    // (local coords offset by +1,+1 to sit inside the permanent border).
+    const tiles = [];
+    for(let y=0;y<SECTOR_TILES_Y;y++){
+      let row = '';
+      for(let x=0;x<SECTOR_TILES_X;x++){
+        if(x===0||y===0||x===SECTOR_TILES_X-1||y===SECTOR_TILES_Y-1) row += '#';
+        else row += local[y-1][x-1];
+      }
+      tiles.push(row);
+    }
+    tiles[doorLocalRow] = tiles[doorLocalRow].substring(0,doorLocalCol) + 'D' + tiles[doorLocalRow].substring(doorLocalCol+1);
+
+    return {tiles, doorLocalRow, doorLocalCol, doorSide, enemies, crates};
+  }
 
   // Whether a world position falls inside a house footprint (wood flooring)
   // vs out on open grass — used to pick which footstep sound plays.
@@ -1200,39 +1214,58 @@
     return {piece:'corner', rot:0};
   }
 
-  for(let row=0; row<ROWS; row++){
-    for(let col=0; col<COLS; col++){
-      const ch = MAP[row][col];
-      const px = col*TILE, py = row*TILE;
-      if(ch === '#'){
-        const wp = wallPiece(col,row);
-        wallRects.push({x:px, y:py, w:TILE, h:TILE, piece:wp.piece, rot:wp.rot});
-      } else if(ch === '~'){
-        waterRects.push({x:px, y:py, w:TILE, h:TILE});
-        floorTiles.push({x:px+TILE/2, y:py+TILE/2});
-      } else if(ch === 'S'){
-        sandRects.push({x:px, y:py, w:TILE, h:TILE});
-        floorTiles.push({x:px+TILE/2, y:py+TILE/2});
-      } else if(ch === 'T'){
-        treeRects.push({x:px, y:py, w:TILE, h:TILE});
-        // deliberately NOT added to floorTiles — don't spawn things inside a tree trunk
-      } else if(ch === 'V'){
-        windowRects.push({x:px, y:py, w:TILE, h:TILE, broken:false});
-        // deliberately NOT added to floorTiles — don't spawn things in a windowpane
-      } else {
-        floorTiles.push({x:px+TILE/2, y:py+TILE/2});
-        if(insideAHouse(col,row)){
-          interiorRects.push({x:px, y:py, w:TILE, h:TILE});
-          houseFloorTiles.push({x:px+TILE/2, y:py+TILE/2});
+  const movementSolids = []; // blocks physical movement — wall+water+tree rects, rebuilt below (windowRects handled separately in resolveObstacles since "solid" depends on their live broken state)
+  const sightSolids = [];    // opaque to line-of-sight — wall+tree rects, rebuilt below
+  const windowGrid = new Map(); // "row*COLS+col" -> the live windowRects entry at that tile, so it can still be mutated (broken flag) in place
+
+  // Scans the whole grid and rebuilds every derived array above from
+  // scratch. Runs once at load, and again every time enterHouse/exitHouse
+  // swap the interior stage's tiles for a different house's layout (or
+  // hand the stage back to being just an inert solid block) — everywhere
+  // else in the game reads these baked arrays/rects rather than MAP
+  // directly, so nothing downstream (collision, rendering, line of sight)
+  // needs to know the stage even exists.
+  function rebuildCollisionCaches(){
+    wallRects.length = 0; waterRects.length = 0; sandRects.length = 0; treeRects.length = 0;
+    windowRects.length = 0; floorTiles.length = 0; houseFloorTiles.length = 0; interiorRects.length = 0;
+    windowGrid.clear();
+    for(let row=0; row<ROWS; row++){
+      for(let col=0; col<COLS; col++){
+        const ch = MAP[row][col];
+        const px = col*TILE, py = row*TILE;
+        if(ch === '#'){
+          const wp = wallPiece(col,row);
+          wallRects.push({x:px, y:py, w:TILE, h:TILE, piece:wp.piece, rot:wp.rot});
+        } else if(ch === '~'){
+          waterRects.push({x:px, y:py, w:TILE, h:TILE});
+          floorTiles.push({x:px+TILE/2, y:py+TILE/2});
+        } else if(ch === 'S'){
+          sandRects.push({x:px, y:py, w:TILE, h:TILE});
+          floorTiles.push({x:px+TILE/2, y:py+TILE/2});
+        } else if(ch === 'T'){
+          treeRects.push({x:px, y:py, w:TILE, h:TILE});
+          // deliberately NOT added to floorTiles — don't spawn things inside a tree trunk
+        } else if(ch === 'V'){
+          const w = {x:px, y:py, w:TILE, h:TILE, broken:false};
+          windowRects.push(w);
+          windowGrid.set(row*COLS+col, w);
+          // deliberately NOT added to floorTiles — don't spawn things in a windowpane
+        } else {
+          floorTiles.push({x:px+TILE/2, y:py+TILE/2});
+          if(insideAHouse(col,row)){
+            interiorRects.push({x:px, y:py, w:TILE, h:TILE});
+            houseFloorTiles.push({x:px+TILE/2, y:py+TILE/2});
+          }
+          if(ch === 'P') playerSpawn = {x:px+TILE/2, y:py+TILE/2};
+          if(ch === 'E') enemySpawns.push({x:px+TILE/2, y:py+TILE/2});
+          if(ch === 'C') crateSpawns.push({x:px+TILE/2, y:py+TILE/2});
         }
-        if(ch === 'P') playerSpawn = {x:px+TILE/2, y:py+TILE/2};
-        if(ch === 'E') enemySpawns.push({x:px+TILE/2, y:py+TILE/2});
-        if(ch === 'C') crateSpawns.push({x:px+TILE/2, y:py+TILE/2});
       }
     }
+    movementSolids.length = 0; movementSolids.push(...wallRects, ...waterRects, ...treeRects);
+    sightSolids.length = 0; sightSolids.push(...wallRects, ...treeRects);
   }
-  const movementSolids = wallRects.concat(waterRects, treeRects); // windowRects handled separately in resolveObstacles since "solid" depends on their live broken state
-  const sightSolids = wallRects.concat(treeRects); // opaque to line-of-sight, same as walls
+  rebuildCollisionCaches();
 
   // ---- second pass: give every wall tile that faces open space below it
   // a 3-tall "face" strip (the wall's visual side/depth) — this includes
@@ -1287,11 +1320,6 @@
     if(row<0||row>=ROWS||col<0||col>=COLS) return false;
     const ch = MAP[row][col];
     return ch==='#' || ch==='T';
-  }
-  const windowGrid = new Map(); // "row*COLS+col" -> the live windowRects entry at that tile, so it can still be mutated (broken flag) in place
-  for(const w of windowRects){
-    const col = Math.floor(w.x/TILE), row = Math.floor(w.y/TILE);
-    windowGrid.set(row*COLS+col, w);
   }
   function windowAt(px, py){
     const col = Math.floor(px/TILE), row = Math.floor(py/TILE);
