@@ -1,45 +1,32 @@
-// NESSHOOTER 3D Addon — full polygon-based renderer (Daggerfall-style: every
-// surface is a textured quad in 3D, projected to screen, painter's-algorithm
-// depth sorted — no raycasting, no per-scanline floor casting).
+// NESSHOOTER 3D Addon — polygon renderer using the base game's real textures,
+// optimized for speed: each quad is drawn as 2 affine-mapped triangles
+// (no per-strip subdivision), images are cached once at load.
 (function(){
-  function makeTex(kind){
-    const c = document.createElement('canvas'); c.width=64; c.height=64;
-    const g = c.getContext('2d');
-    if(kind==='#'){
-      g.fillStyle='#847e8c'; g.fillRect(0,0,64,64);
-      g.strokeStyle='rgba(0,0,0,0.4)'; g.lineWidth=1;
-      for(let y=0;y<64;y+=16){
-        g.beginPath(); g.moveTo(0,y); g.lineTo(64,y); g.stroke();
-        const off=(y/16)%2?8:0;
-        for(let x=off;x<64;x+=16){ g.beginPath(); g.moveTo(x,y); g.lineTo(x,y+16); g.stroke(); }
-      }
-    } else if(kind==='T'){
-      g.fillStyle='#2e7834'; g.fillRect(0,0,64,64);
-      g.fillStyle='rgba(0,0,0,0.15)';
-      for(let i=0;i<40;i++){ g.beginPath(); g.arc(Math.random()*64,Math.random()*64,3+Math.random()*3,0,7); g.fill(); }
-    } else if(kind==='grass'){
-      g.fillStyle='#368a3a'; g.fillRect(0,0,64,64);
-      g.strokeStyle='rgba(0,0,0,0.12)';
-      for(let i=0;i<25;i++){ g.beginPath(); const x=Math.random()*64,y=Math.random()*64; g.moveTo(x,y); g.lineTo(x+2,y-6); g.stroke(); }
-    } else if(kind==='sand'){
-      g.fillStyle='#c6b68a'; g.fillRect(0,0,64,64);
-      g.fillStyle='rgba(0,0,0,0.08)';
-      for(let i=0;i<50;i++) g.fillRect(Math.random()*64,Math.random()*64,2,2);
-    } else if(kind==='water'){
-      g.fillStyle='#285aaa'; g.fillRect(0,0,64,64);
-      g.strokeStyle='rgba(255,255,255,0.15)';
-      for(let y=8;y<64;y+=12){ g.beginPath(); g.moveTo(0,y); g.lineTo(64,y); g.stroke(); }
-    } else if(kind==='wood'){
-      g.fillStyle='#785434'; g.fillRect(0,0,64,64);
-      g.strokeStyle='rgba(0,0,0,0.25)';
-      for(let x=0;x<64;x+=10){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,64); g.stroke(); }
-    } else { // ceiling
-      g.fillStyle='#26262e'; g.fillRect(0,0,64,64);
-    }
+  const PATHS = {
+    '#': 'textures/tiles/wall_horizontal.png',
+    'T': 'textures/tiles/tree.png',
+    grass: 'textures/ground/grass.png',
+    sand: 'textures/ground/sand.png',
+    water: 'textures/tiles/water.png',
+    wood: 'textures/ground/wood.png',
+    ceil: null
+  };
+  function fallback(kind){
+    const c=document.createElement('canvas'); c.width=64;c.height=64;
+    const g=c.getContext('2d');
+    const colors={'#':'#847e8c',T:'#2e7834',grass:'#368a3a',sand:'#c6b68a',water:'#285aaa',wood:'#785434',ceil:'#26262e'};
+    g.fillStyle=colors[kind]||'#888'; g.fillRect(0,0,64,64);
     return c;
   }
-  const TEX = { '#':makeTex('#'), 'T':makeTex('T'), grass:makeTex('grass'), sand:makeTex('sand'),
-                water:makeTex('water'), wood:makeTex('wood'), ceil:makeTex('ceil') };
+  const TEX = {};
+  for(const k in PATHS){
+    TEX[k] = fallback(k);
+    if(PATHS[k]){
+      const img = new Image();
+      img.onload = ()=>{ TEX[k] = img; };
+      img.src = PATHS[k];
+    }
+  }
 
   function init(deps){
     const {
@@ -49,10 +36,7 @@
     } = deps;
 
     let fpsPitch = 0;
-    const FPS_TURN_SPEED = 2.6;
-    const FPS_PITCH_SPEED = 140;
-    const FPS_PITCH_MAX = 50;
-    const FPS_MOUSE_SENS = 0.003;
+    const FPS_TURN_SPEED = 2.6, FPS_PITCH_SPEED = 140, FPS_PITCH_MAX = 50, FPS_MOUSE_SENS = 0.003;
     const WALL_H = TILE, EYE_Z = TILE*0.5, FOCAL = 280;
     const RADIUS = 14;
 
@@ -94,61 +78,52 @@
       function project(wx,wy,wz){
         const dxw = wx-player.x, dyw = wy-player.y;
         const depth = dxw*fx + dyw*fy;
-        const horizd = dxw*rx + dyw*ry;
         if(depth < 0.15) return null;
-        return { x: W/2 + (horizd/depth)*FOCAL, y: horizon - ((wz-EYE_Z)/depth)*FOCAL, depth };
+        const horizd = dxw*rx + dyw*ry;
+        return { x: W/2 + (horizd/depth)*FOCAL, y: horizon - ((wz-EYE_Z)/depth)*FOCAL };
       }
 
-      // Build every surface (floor, ceiling, wall faces) as a world-space quad + texture.
       const pc = Math.floor(player.x/TILE), pr = Math.floor(player.y/TILE);
-      const quads = []; // {p:[[x,y,z]x4], tex, cx,cy (world center for depth sort), shadeDist}
+      const quads = [];
       const neigh = (rr,cc)=> (rr<0||rr>=ROWS||cc<0||cc>=COLS) ? null : MAP[rr][cc];
       const solid = ch2=> ch2==='#'||ch2==='T';
 
       for(let r=pr-RADIUS;r<=pr+RADIUS;r++){
+        if(r<0||r>=ROWS) continue;
         for(let c=pc-RADIUS;c<=pc+RADIUS;c++){
-          if(r<0||r>=ROWS||c<0||c>=COLS) continue;
+          if(c<0||c>=COLS) continue;
           const ch = MAP[r][c];
           const x0=c*TILE, y0=r*TILE, x1=x0+TILE, y1=y0+TILE, cx=(x0+x1)/2, cy=(y0+y1)/2;
           if(solid(ch)){
-            if(!solid(neigh(r-1,c))) quads.push({p:[[x0,y0,0],[x1,y0,0],[x1,y0,WALL_H],[x0,y0,WALL_H]], tex:TEX[ch], cx, cy:y0});
-            if(!solid(neigh(r+1,c))) quads.push({p:[[x1,y1,0],[x0,y1,0],[x0,y1,WALL_H],[x1,y1,WALL_H]], tex:TEX[ch], cx, cy:y1});
-            if(!solid(neigh(r,c-1))) quads.push({p:[[x0,y1,0],[x0,y0,0],[x0,y0,WALL_H],[x0,y1,WALL_H]], tex:TEX[ch], cx:x0, cy});
-            if(!solid(neigh(r,c+1))) quads.push({p:[[x1,y0,0],[x1,y1,0],[x1,y1,WALL_H],[x1,y0,WALL_H]], tex:TEX[ch], cx:x1, cy});
+            const tx = TEX[ch];
+            if(!solid(neigh(r-1,c))) quads.push({p:[[x0,y0,0],[x1,y0,0],[x1,y0,WALL_H],[x0,y0,WALL_H]], tex:tx, cx, cy:y0});
+            if(!solid(neigh(r+1,c))) quads.push({p:[[x1,y1,0],[x0,y1,0],[x0,y1,WALL_H],[x1,y1,WALL_H]], tex:tx, cx, cy:y1});
+            if(!solid(neigh(r,c-1))) quads.push({p:[[x0,y1,0],[x0,y0,0],[x0,y0,WALL_H],[x0,y1,WALL_H]], tex:tx, cx:x0, cy});
+            if(!solid(neigh(r,c+1))) quads.push({p:[[x1,y0,0],[x1,y1,0],[x1,y1,WALL_H],[x1,y0,WALL_H]], tex:tx, cx:x1, cy});
           } else {
-            const ftex = floorTexAt(cx,cy);
-            quads.push({p:[[x0,y0,0],[x1,y0,0],[x1,y1,0],[x0,y1,0]], tex:ftex, cx, cy});
+            quads.push({p:[[x0,y0,0],[x1,y0,0],[x1,y1,0],[x0,y1,0]], tex:floorTexAt(cx,cy), cx, cy});
             quads.push({p:[[x0,y0,WALL_H],[x1,y0,WALL_H],[x1,y1,WALL_H],[x0,y1,WALL_H]], tex:TEX.ceil, cx, cy});
           }
         }
       }
 
-      // painter's algorithm: farthest first
       quads.forEach(q=> q.d2 = (q.cx-player.x)**2+(q.cy-player.y)**2);
       quads.sort((a,b)=> b.d2 - a.d2);
 
-      const STRIPS = 6;
+      const S = 64;
       for(const q of quads){
         const [p0,p1,p2,p3] = q.p;
+        const pa=project(...p0), pb=project(...p1), pcc=project(...p2), pd=project(...p3);
+        if(!pa||!pb||!pcc||!pd) continue;
         const dist = Math.sqrt(q.d2);
         const shade = Math.max(0.2, 1-dist/(TILE*16));
-        // subdivide along the p0->p1 edge (works for both wall quads and floor/ceiling quads,
-        // since in both cases p0->p1 and p3->p2 are the two "long" parallel edges)
-        for(let s=0;s<STRIPS;s++){
-          const t0=s/STRIPS, t1=(s+1)/STRIPS;
-          const lerp=(a,b,t)=>[a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
-          const A=lerp(p0,p1,t0), B=lerp(p0,p1,t1), C=lerp(p3,p2,t1), D=lerp(p3,p2,t0);
-          const pa=project(...A), pb=project(...B), pc2=project(...C), pd=project(...D);
-          if(!pa||!pb||!pc2||!pd) continue;
-          const sx0=t0*64, sx1=t1*64;
-          drawTexTri(q.tex, sx0,0, sx1,0, sx0,64, pa.x,pa.y, pb.x,pb.y, pd.x,pd.y);
-          drawTexTri(q.tex, sx1,0, sx1,64, sx0,64, pb.x,pb.y, pc2.x,pc2.y, pd.x,pd.y);
-          if(shade<1){
-            ctx.fillStyle = `rgba(0,0,0,${(1-shade)*0.75})`;
-            ctx.beginPath();
-            ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.lineTo(pc2.x,pc2.y); ctx.lineTo(pd.x,pd.y);
-            ctx.closePath(); ctx.fill();
-          }
+        drawTexTri(q.tex, 0,0, S,0, 0,S, pa.x,pa.y, pb.x,pb.y, pd.x,pd.y);
+        drawTexTri(q.tex, S,0, S,S, 0,S, pb.x,pb.y, pcc.x,pcc.y, pd.x,pd.y);
+        if(shade<1){
+          ctx.fillStyle = `rgba(0,0,0,${(1-shade)*0.75})`;
+          ctx.beginPath();
+          ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.lineTo(pcc.x,pcc.y); ctx.lineTo(pd.x,pd.y);
+          ctx.closePath(); ctx.fill();
         }
       }
       drawTopHud();
