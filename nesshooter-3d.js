@@ -28,6 +28,52 @@
     }
   }
 
+  // ---- RPG Maker MZ-style A4 wall autotile ----
+  // Config: adjust these if your tileA4_walls.png uses a different path or
+  // if the wall "kind" you want isn't the first one in the sheet.
+  const WALL_CONFIG = { path: 'textures/tileA4_walls.png', kindCol: 0, tilePx: 16 };
+  window.NesShooter3D_wallConfig = WALL_CONFIG; // tweak from devtools/console if needed
+
+  // 16 shapes (bit0=N,bit1=E,bit2=S,bit3=W solid), each a set of 4 quarter-tile
+  // [col,row] coords (in 24px quarter-tile units) to composite TL,TR,BL,BR.
+  const WALL_AUTOTILE_TABLE = [
+    [[2,2],[1,2],[2,1],[1,1]], [[0,2],[1,2],[0,1],[1,1]], [[2,0],[1,0],[2,1],[1,1]], [[0,0],[1,0],[0,1],[1,1]],
+    [[2,2],[3,2],[2,1],[3,1]], [[0,2],[3,2],[0,1],[3,1]], [[2,0],[3,0],[2,1],[3,1]], [[0,0],[3,0],[0,1],[3,1]],
+    [[2,2],[1,2],[2,3],[1,3]], [[0,2],[1,2],[0,3],[1,3]], [[2,0],[1,0],[2,3],[1,3]], [[0,0],[1,0],[0,3],[1,3]],
+    [[2,2],[3,2],[2,3],[3,3]], [[0,2],[3,2],[0,3],[3,3]], [[2,0],[3,0],[2,3],[3,3]], [[0,0],[3,0],[0,3],[3,3]]
+  ];
+
+  let wallSheet = null, wallSheetReady = false;
+  (function loadWallSheet(){
+    const img = new Image();
+    img.onload = ()=>{ wallSheet = img; wallSheetReady = true; };
+    img.src = WALL_CONFIG.path;
+  })();
+
+  const wallTexCache = {};
+  function shapeIndex(nSolid,eSolid,sSolid,wSolid){
+    return (nSolid?1:0)|(eSolid?2:0)|(sSolid?4:0)|(wSolid?8:0);
+  }
+  // Builds (and caches) a 48x48 canvas for one of the 16 connectivity shapes
+  // by pasting 4 quarter-tiles from the A4 sheet's "walktop" sub-block.
+  function getWallTex(shape){
+    if(!wallSheetReady) return TEX['#'];
+    const key = WALL_CONFIG.kindCol+'_'+shape;
+    if(wallTexCache[key]) return wallTexCache[key];
+    const q = WALL_CONFIG.tilePx/2; // 24px quarter at default 48px tile
+    const originX = WALL_CONFIG.kindCol*4*q; // kind block is 2 tiles (4 quarters) wide
+    const c = document.createElement('canvas'); c.width=q*2; c.height=q*2;
+    const g = c.getContext('2d');
+    const corners = WALL_AUTOTILE_TABLE[shape];
+    const dst = [[0,0],[q,0],[0,q],[q,q]];
+    for(let i=0;i<4;i++){
+      const [qx,qy] = corners[i], [dx,dy] = dst[i];
+      g.drawImage(wallSheet, originX+qx*q, qy*q, q,q, dx,dy, q,q);
+    }
+    wallTexCache[key] = c;
+    return c;
+  }
+
   function init(deps){
     const {
       ctx, canvas, player, MAP, ROWS, COLS, TILE, W, H,
@@ -95,7 +141,11 @@
           const ch = MAP[r][c];
           const x0=c*TILE, y0=r*TILE, x1=x0+TILE, y1=y0+TILE, cx=(x0+x1)/2, cy=(y0+y1)/2;
           if(solid(ch)){
-            const tx = TEX[ch];
+            let tx = TEX[ch];
+            if(ch==='#'){
+              const shape = shapeIndex(solid(neigh(r-1,c)), solid(neigh(r,c+1)), solid(neigh(r+1,c)), solid(neigh(r,c-1)));
+              tx = getWallTex(shape);
+            }
             if(!solid(neigh(r-1,c))) quads.push({p:[[x0,y0,0],[x1,y0,0],[x1,y0,WALL_H],[x0,y0,WALL_H]], tex:tx, cx, cy:y0});
             if(!solid(neigh(r+1,c))) quads.push({p:[[x1,y1,0],[x0,y1,0],[x0,y1,WALL_H],[x1,y1,WALL_H]], tex:tx, cx, cy:y1});
             if(!solid(neigh(r,c-1))) quads.push({p:[[x0,y1,0],[x0,y0,0],[x0,y0,WALL_H],[x0,y1,WALL_H]], tex:tx, cx:x0, cy});
@@ -112,18 +162,28 @@
 
       for(const q of quads){
         const [p0,p1,p2,p3] = q.p;
-        const pa=project(...p0), pb=project(...p1), pcc=project(...p2), pd=project(...p3);
-        if(!pa||!pb||!pcc||!pd) continue;
         const dist = Math.sqrt(q.d2);
         const shade = Math.max(0.2, 1-dist/(TILE*16));
         const SW = q.tex.naturalWidth || q.tex.width, SH = q.tex.naturalHeight || q.tex.height;
-        drawTexTri(q.tex, 0,0, SW,0, 0,SH, pa.x,pa.y, pb.x,pb.y, pd.x,pd.y);
-        drawTexTri(q.tex, SW,0, SW,SH, 0,SH, pb.x,pb.y, pcc.x,pcc.y, pd.x,pd.y);
-        if(shade<1){
-          ctx.fillStyle = `rgba(0,0,0,${(1-shade)*0.75})`;
-          ctx.beginPath();
-          ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.lineTo(pcc.x,pcc.y); ctx.lineTo(pd.x,pd.y);
-          ctx.closePath(); ctx.fill();
+        // Affine (non-perspective-correct) triangle mapping only looks right
+        // over small screen spans; close-up quads need more slices, distant
+        // ones need almost none. Scale slice count by TILE/dist.
+        const STRIPS = dist < TILE*1.5 ? 6 : dist < TILE*4 ? 3 : 1;
+        for(let s=0;s<STRIPS;s++){
+          const t0=s/STRIPS, t1=(s+1)/STRIPS;
+          const lerp=(a,b,t)=>[a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+          const A=lerp(p0,p1,t0), B=lerp(p0,p1,t1), C=lerp(p3,p2,t1), D=lerp(p3,p2,t0);
+          const pa=project(...A), pb=project(...B), pcc=project(...C), pd=project(...D);
+          if(!pa||!pb||!pcc||!pd) continue;
+          const sx0=t0*SW, sx1=t1*SW;
+          drawTexTri(q.tex, sx0,0, sx1,0, sx0,SH, pa.x,pa.y, pb.x,pb.y, pd.x,pd.y);
+          drawTexTri(q.tex, sx1,0, sx1,SH, sx0,SH, pb.x,pb.y, pcc.x,pcc.y, pd.x,pd.y);
+          if(shade<1){
+            ctx.fillStyle = `rgba(0,0,0,${(1-shade)*0.75})`;
+            ctx.beginPath();
+            ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.lineTo(pcc.x,pcc.y); ctx.lineTo(pd.x,pd.y);
+            ctx.closePath(); ctx.fill();
+          }
         }
       }
       drawTopHud();
