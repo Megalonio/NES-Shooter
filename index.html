@@ -4904,25 +4904,25 @@
   }
 
   // Floating damage numbers: each digit is drawn from its own ui/#.png
-  // glyph, laid out side by side and centered above the hit point. Falls
-  // back to nothing (silently skipped) for any digit whose image hasn't
-  // loaded yet, same "degrade gracefully" pattern as every other texture
-  // slot in this file.
-  const HIT_NUMBER_GLYPH_H = 7; // rendered glyph height in world px — small, NES-tile scale
+  // glyph at its native pixel size (these are 16x16 source images), laid
+  // out side by side and centered above the hit point. Falls back to
+  // nothing (silently skipped) for any digit whose image hasn't loaded
+  // yet, same "degrade gracefully" pattern as every other texture slot in
+  // this file.
   function drawHitNumbers(){
     for(const n of hitNumbers){
       const frac = 1 - n.age/n.life;
       const alpha = Math.min(1, frac*1.4); // holds near-full opacity, then fades fast at the very end
       const scale = 0.8 + Math.min(1, n.age/0.12)*0.2; // tiny pop-in grow over the first ~0.12s
 
-      // measure total width first so the whole string can be centered
+      // measure total width first so the whole string can be centered —
+      // native size, no resizing beyond the small pop-in scale above
       const glyphs = [];
       let totalW = 0;
       for(const ch of n.text){
         const img = getTex('ui.number'+ch);
         if(!img){ glyphs.push(null); continue; }
-        const h = HIT_NUMBER_GLYPH_H*scale;
-        const w = h * (img.width/img.height);
+        const w = img.width*scale, h = img.height*scale;
         glyphs.push({img, w, h});
         totalW += w;
       }
@@ -4931,7 +4931,7 @@
       ctx.globalAlpha = alpha;
       for(const g of glyphs){
         if(g) ctx.drawImage(g.img, dx, n.y - g.h/2, g.w, g.h);
-        else dx += HIT_NUMBER_GLYPH_H*0.6; // missing glyph — leave a placeholder gap instead of crushing the rest together
+        else dx += 8; // missing glyph — leave a placeholder gap instead of crushing the rest together
         if(g) dx += g.w;
       }
       ctx.restore();
