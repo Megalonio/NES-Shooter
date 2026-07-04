@@ -1382,10 +1382,17 @@
   //    column mapping. Ground-drop pickup icons are drawn 32x32.
   // ==================================================================
   const TEXTURES = {
+    // Each ground surface can have multiple texture variants for visual
+    // variety — drop in grass.png alone, or grass.png + grass1.png +
+    // grass2.png (etc, up to GROUND_MAX_VARIANTS below) and every matching
+    // file that actually loads gets folded into that surface's pool, then
+    // each tile on the map randomly (but deterministically — see
+    // pickGroundVariant) picks one from the pool. See loadGroundVariants()
+    // and bakeBackground() below for how the pool is built and used.
     ground: {
-      grass: 'textures/ground/grass.png',
-      wood:  'textures/ground/wood.png',
-      sand:  'textures/ground/sand.png'
+      grass: 'textures/ground/grass',
+      wood:  'textures/ground/wood',
+      sand:  'textures/ground/sand'
     },
     tiles: {
       wallH:      'textures/tiles/wall_horizontal.png', // straight run, "-"
@@ -1914,9 +1921,44 @@
     TILE_IMG_CACHE[cacheKey] = c;
     return c;
   }
-  loadTex('ground.grass', TEXTURES.ground.grass);
-  loadTex('ground.wood',  TEXTURES.ground.wood);
-  loadTex('ground.sand',  TEXTURES.ground.sand);
+  // ---- ground texture variants: auto-detects grass.png / grass1.png /
+  // grass2.png / ... (and the same for wood, sand) so dropping in extra
+  // numbered files is all it takes to add variety — no other config. Base
+  // filename (no number) is variant 0; numbered files go up to
+  // GROUND_MAX_VARIANTS. Any that don't exist just 404 silently (same
+  // "degrade gracefully" pattern loadTex already uses) and are excluded
+  // from that surface's pool.
+  const GROUND_MAX_VARIANTS = 8;
+  function groundVariantKey(surface, i){ return 'ground.'+surface+'.'+i; }
+  function loadGroundVariants(surface, baseUrl){
+    loadTex(groundVariantKey(surface,0), baseUrl+'.png');
+    for(let i=1;i<=GROUND_MAX_VARIANTS;i++){
+      loadTex(groundVariantKey(surface,i), baseUrl+i+'.png');
+    }
+  }
+  // Which variant keys actually loaded for a surface, right now. Called
+  // fresh each bake rather than cached, since more variants can finish
+  // loading (and get folded in) after the first bake already ran.
+  function getGroundVariants(surface){
+    const keys = [];
+    for(let i=0;i<=GROUND_MAX_VARIANTS;i++){
+      const k = groundVariantKey(surface,i);
+      if(getTex(k)) keys.push(k);
+    }
+    return keys;
+  }
+  // Deterministic per-tile pick from a variant pool — same tile always
+  // rolls the same variant (no shimmering/re-rolling on rebake or redraw),
+  // but different tiles get a good visual mix.
+  function pickGroundVariant(keys, col, row){
+    if(keys.length===0) return null;
+    if(keys.length===1) return keys[0];
+    const r = hash2(col*13.37+1.7, row*7.91+9.3);
+    return keys[Math.floor(r*keys.length) % keys.length];
+  }
+  loadGroundVariants('grass', TEXTURES.ground.grass);
+  loadGroundVariants('wood',  TEXTURES.ground.wood);
+  loadGroundVariants('sand',  TEXTURES.ground.sand);
   loadTex('tiles.wallH',      TEXTURES.tiles.wallH);
   loadTex('tiles.wallV',      TEXTURES.tiles.wallV);
   loadTex('tiles.wallCorner', TEXTURES.tiles.wallCorner);
@@ -2149,11 +2191,17 @@
   function bakeBackground(){
     bgCtx.clearRect(0,0,WORLD_W,WORLD_H);
 
-    // ---- base grass ----
-    const grassPat = getTilePattern('ground.grass');
-    if(grassPat){
-      bgCtx.fillStyle = grassPat;
-      bgCtx.fillRect(0,0,WORLD_W,WORLD_H);
+    // ---- base grass (per-tile, picking randomly from whichever grass/
+    // grass1/grass2/... variants actually loaded) ----
+    const grassKeys = getGroundVariants('grass');
+    if(grassKeys.length){
+      for(let row=0; row<ROWS; row++){
+        for(let col=0; col<COLS; col++){
+          const key = pickGroundVariant(grassKeys, col, row);
+          const tile = getTileImg(key, TILE, TILE);
+          if(tile) bgCtx.drawImage(tile, col*TILE, row*TILE);
+        }
+      }
     } else {
       // base grass fill + speckled blade texture, deterministic so it never shimmers
       bgCtx.fillStyle = '#3c5a30';
@@ -2171,14 +2219,14 @@
 
     // (tile grid removed — textures speak for themselves)
 
-    // ---- wood flooring inside houses ----
-    const woodPat = getTilePattern('ground.wood');
+    // ---- wood flooring inside houses (per-tile, randomized among wood/
+    // wood1/wood2/... variants) ----
+    const woodKeys = getGroundVariants('wood');
     for(const o of interiorRects){
-      if(woodPat){
-        // pattern is anchored to the canvas origin, not o.x/o.y, so the
-        // plank grid lines up seamlessly between separate rooms too
-        bgCtx.fillStyle = woodPat;
-        bgCtx.fillRect(o.x,o.y,o.w,o.h);
+      const key = woodKeys.length ? pickGroundVariant(woodKeys, o.x/TILE, o.y/TILE) : null;
+      const tile = key ? getTileImg(key, TILE, TILE) : null;
+      if(tile){
+        bgCtx.drawImage(tile, o.x, o.y);
       } else {
         bgCtx.fillStyle = '#5b4a35';
         bgCtx.fillRect(o.x,o.y,o.w,o.h);
@@ -2190,12 +2238,13 @@
       }
     }
 
-    // ---- sand/beach ----
-    const sandPat = getTilePattern('ground.sand');
+    // ---- sand/beach (per-tile, randomized among sand/sand1/sand2/... variants) ----
+    const sandKeys = getGroundVariants('sand');
     for(const o of sandRects){
-      if(sandPat){
-        bgCtx.fillStyle = sandPat;
-        bgCtx.fillRect(o.x,o.y,o.w,o.h);
+      const key = sandKeys.length ? pickGroundVariant(sandKeys, o.x/TILE, o.y/TILE) : null;
+      const tile = key ? getTileImg(key, TILE, TILE) : null;
+      if(tile){
+        bgCtx.drawImage(tile, o.x, o.y);
       } else {
         // speckled grain so it doesn't read as flat grass with a different
         // tint — same deterministic hash technique as the grass above
