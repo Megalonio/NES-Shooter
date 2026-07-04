@@ -4090,6 +4090,7 @@
     const spd = spdOverride!==undefined ? spdOverride : weapon.bulletSpeed;
     bullets.push({
       x: fromX, y: fromY,
+      originX: fromX, originY: fromY, // fixed muzzle position — unlike x/y this never moves, so it's still usable as "where that shot came from" after the bullet's traveled or is long gone
       vx: Math.cos(a)*spd, vy: Math.sin(a)*spd,
       life: lifeOverride!==undefined ? lifeOverride : weapon.life,
       baseDmg: dmgOverride!==undefined ? dmgOverride : weapon.damage, // damage at muzzle velocity — actual damage dealt scales with however much velocity is left when it hits
@@ -4098,6 +4099,73 @@
       friendly,
       wasInsideWall: false
     });
+    // A gunshot is loud regardless of who fired it — any already-aggroed
+    // enemy within earshot (investigating or sweeping, not actively
+    // chasing with eyes on you) redirects toward where the sound came
+    // from instead of wherever they were previously headed. Enemies who
+    // haven't noticed the player at all yet stay oblivious — this only
+    // redirects an already-alerted search, it doesn't start one.
+    alertToSound(fromX, fromY);
+  }
+
+  // See fireBullet above for when this fires. Only touches enemies already
+  // in 'investigate' or 'sweep' — a 'chase' enemy already has real LOS and
+  // shouldn't get yanked off it, and an 'idle' enemy has no reason yet to
+  // care about a sound.
+  function alertToSound(x, y){
+    for(const e of enemies){
+      if(!e.alive || !e.alertState || e.alertState === 'idle' || e.alertState === 'chase') continue;
+      if(Math.hypot(e.x-x, e.y-y) > SOUND_RANGE.shot) continue;
+      e.lastSeenX = x; e.lastSeenY = y;
+      e.alertState = 'investigate';
+      e.investigateTimer = INVESTIGATE_TIME;
+    }
+  }
+
+  // Fires one shot from enemy `e` toward `targetAngle`, same aim-error/wall-
+  // penetration/reload rules as the AI loop's own fire logic — factored out
+  // so both the normal chase fire loop AND the instant "shot back through
+  // the wall" reaction (see enemyGotShot below) share one implementation.
+  function enemyFireShotAt(e, targetAngle){
+    const wd = e.weaponDef;
+    e.shotCd = Math.max(0.15, wd.cooldown);
+    e.ammo -= 1;
+    const pelletCount = wd.pellets || 1;
+    const wdWallRetention = WALL_PENETRATION_BY_AMMO[wd.ammoType] !== undefined
+      ? WALL_PENETRATION_BY_AMMO[wd.ammoType]
+      : WALL_PENETRATION_RETENTION_PER_M;
+    const fireAngle = targetAngle + (Math.random()-0.5)*ENEMY_AIM_ERROR;
+    for(let p=0; p<pelletCount; p++){
+      fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
+    }
+    emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
+    // Magazine empty — same reload downtime the player eats, no free
+    // pass. A high-capacity/belt-fed roll (magSize in the hundreds)
+    // just means this essentially never comes up.
+    if(e.ammo<=0){
+      e.reloading = true;
+      e.reloadTimer = wd.reloadTime || 1.5;
+    }
+  }
+
+  // Getting shot is its own, louder wake-up call than merely hearing
+  // gunfire — a bullet that actually lands (even one that punched through
+  // a wall to do it) tells an enemy almost exactly where the player is.
+  // Unlike a normal LOS loss, this skips straight past "investigate" being
+  // gated on line of sight: they instantly know roughly where you are,
+  // snap off a reflexive shot back at the wall/direction the round came
+  // from (if they're carrying a gun — zombies have nothing to shoot back
+  // with), and start pushing toward you to reacquire real line of sight.
+  function enemyGotShot(e, bullet){
+    e.aware = true;
+    e.alertState = 'investigate';
+    e.lastSeenX = player.x; e.lastSeenY = player.y;
+    e.investigateTimer = INVESTIGATE_TIME;
+    e.reactionShootTimer = REACTION_SHOOT_WINDOW;
+    if(e.weaponDef && !e.reloading && e.ammo>0){
+      const backAngle = Math.atan2(bullet.originY-e.y, bullet.originX-e.x);
+      enemyFireShotAt(e, backAngle);
+    }
   }
 
   function angleDiff(a, b){
@@ -4563,6 +4631,8 @@
               spawnImpact(b.x, b.y, 'flesh');
               if(e.hp<=0){
                 onEnemyKilled(e, ei);
+              } else {
+                enemyGotShot(e, b);
               }
               break;
             }
@@ -4745,26 +4815,6 @@
           e.reloadTimer -= dt;
           if(e.reloadTimer<=0){ e.reloading = false; e.ammo = e.magSize; }
         }
-        function fireEnemyShotAt(targetAngle){
-          e.shotCd = Math.max(0.15, wd.cooldown);
-          e.ammo -= 1;
-          const pelletCount = wd.pellets || 1;
-          const wdWallRetention = WALL_PENETRATION_BY_AMMO[wd.ammoType] !== undefined
-            ? WALL_PENETRATION_BY_AMMO[wd.ammoType]
-            : WALL_PENETRATION_RETENTION_PER_M;
-          const fireAngle = targetAngle + (Math.random()-0.5)*ENEMY_AIM_ERROR;
-          for(let p=0; p<pelletCount; p++){
-            fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
-          }
-          emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
-          // Magazine empty — same reload downtime the player eats, no free
-          // pass. A high-capacity/belt-fed roll (magSize in the hundreds)
-          // just means this essentially never comes up.
-          if(e.ammo<=0){
-            e.reloading = true;
-            e.reloadTimer = wd.reloadTime || 1.5;
-          }
-        }
         if(enemyHasLOS){
           e.aware = true;
           e.alertState = 'chase';
@@ -4784,7 +4834,7 @@
               // Aim, don't laser-target: `a` (used for movement/facing above)
               // stays exact, but the actual shot gets its own random cone of
               // error on top of the weapon's own spread.
-              fireEnemyShotAt(a);
+              enemyFireShotAt(e, a);
             }
           }
         } else if(e.alertState === 'chase'){
@@ -4805,7 +4855,7 @@
             if(!e.reloading){
               e.shotCd -= dt;
               if(distToLast < 300 && e.shotCd<=0 && e.ammo>0 && canSee(e.x, e.y, e.lastSeenX, e.lastSeenY, 320)){
-                fireEnemyShotAt(aToLast);
+                enemyFireShotAt(e, aToLast);
               }
             }
           }
