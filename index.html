@@ -888,10 +888,10 @@
       let chosen = null;
       for(const side of sides){
         let dCol, dRow, oCol, oRow;
-        if(side==='north'){ dCol=randInt(house.x, house.x+house.w-1); dRow=house.y; oCol=dCol; oRow=house.y-1; }
-        else if(side==='south'){ dCol=randInt(house.x, house.x+house.w-1); dRow=house.y+house.h-1; oCol=dCol; oRow=house.y+house.h; }
-        else if(side==='west'){ dRow=randInt(house.y, house.y+house.h-1); dCol=house.x; oCol=house.x-1; oRow=dRow; }
-        else { dRow=randInt(house.y, house.y+house.h-1); dCol=house.x+house.w-1; oCol=house.x+house.w; oRow=dRow; }
+        if(side==='north'){ dCol=randInt(house.x+1, house.x+house.w-2); dRow=house.y; oCol=dCol; oRow=house.y-1; }
+        else if(side==='south'){ dCol=randInt(house.x+1, house.x+house.w-2); dRow=house.y+house.h-1; oCol=dCol; oRow=house.y+house.h; }
+        else if(side==='west'){ dRow=randInt(house.y+1, house.y+house.h-2); dCol=house.x; oCol=house.x-1; oRow=dRow; }
+        else { dRow=randInt(house.y+1, house.y+house.h-2); dCol=house.x+house.w-1; oCol=house.x+house.w; oRow=dRow; }
         if(oRow<0||oRow>=ROWS||oCol<0||oCol>=COLS) continue;
         if(grid[oRow][oCol] === '.'){ chosen = {side,dCol,dRow,oCol,oRow}; break; }
       }
@@ -1089,13 +1089,21 @@
     layoutSide(corridorRow+2, SW-1, corridorRow+1);    // rooms below/after it
 
     // Front door: one end of the corridor, opening straight onto the
-    // building's outer wall — the natural "front hall" spot.
+    // building's outer wall — the natural "front hall" spot. This has to
+    // land exactly on the border ring (stage col/row 0 or max), NOT run
+    // through toStage() like every floor coordinate above — toStage's +1
+    // offset is what keeps floor tiles off the border, which is exactly
+    // wrong here: the door needs to sit ON that border tile, replacing a
+    // wall tile with a doorway, same as the outdoor door does.
     const doorAtStart = rng() < 0.5;
-    const longPos = doorAtStart ? 0 : LW-1;
-    const doorStage = toStage(longPos, corridorRow);
-    let doorSide;
-    if(!vertical) doorSide = doorAtStart ? 'west' : 'east';
-    else doorSide = doorAtStart ? 'north' : 'south';
+    let doorStage, doorSide;
+    if(!vertical){
+      doorStage = { row: corridorRow+1, col: doorAtStart ? 0 : SECTOR_TILES_X-1 };
+      doorSide = doorAtStart ? 'west' : 'east';
+    } else {
+      doorStage = { row: doorAtStart ? 0 : SECTOR_TILES_Y-1, col: corridorRow+1 };
+      doorSide = doorAtStart ? 'north' : 'south';
+    }
 
     // A couple of crates and a light scattering of enemies — one pass each,
     // scaled to however many rooms this particular house rolled.
@@ -3103,17 +3111,20 @@
   function spawnEnemy(at){
     const pos = at || pickHouseSpawn(player, SPAWN_SAFE_DIST);
     const wanderAngle = Math.random()*Math.PI*2;
+    const wd = pickWeaponDef(); // rolled from the same loot table as crates — fires with its real stats, and drops it on death (see dropEnemyWeapon)
     return {
       x: pos.x, y: pos.y,
       r: CHAR_FOOT_R, hp: 40, maxHp: 40,
       speed: 36, // r and speed scaled down along with TILE, see note above
+      speedMul: wd.speedMul || 1, // same carry-weight penalty the player pays — a minigun-toting enemy is just as slowed down as you'd be
       alive: true,
       wanderAngle, wanderTimer: 0,
       facing: wanderAngle, // which way they're currently looking — see ENEMY_VIEW_ARC_HALF below, can't detect the player behind them
       aware: false,        // once they've spotted the player through the facing cone, LOS alone keeps them locked on — losing LOS resets this, requiring the cone check again to re-spot
       shotCd: 0,
+      ammo: wd.magSize, magSize: wd.magSize, reloading: false, reloadTimer: 0, // same magazine/reload limits the player lives with — see the reload branch below
       soundTimer: 0,    // footstep-sound cooldown, only ticks a pulse while hidden from the player
-      weaponDef: pickWeaponDef(), // rolled from the same loot table as crates — fires with its real stats, and drops it on death (see dropEnemyWeapon)
+      weaponDef: wd,
       survivor: randomSurvivorPick(), // hostile "gunmen" reuse the same survivor roster as the player, just red instead of teal
       anim: { state:'idle', frame:0, timer:0 },
       moving: false,
@@ -3199,7 +3210,7 @@
   // Puts a killed enemy's weapon on the ground where they died, same pickup
   // mechanic as a crate drop — walk over it to grab it.
   function dropEnemyWeapon(e){
-    droppedWeapons.push({x: e.x, y: e.y, def: e.weaponDef});
+    droppedWeapons.push({x: e.x, y: e.y, def: e.weaponDef, ammo: e.reloading ? 0 : e.ammo});
   }
 
   // ---- Zombies: unarmed forest enemies. No gun, no drop — just a knife-arm
@@ -3227,6 +3238,7 @@
       x: pos.x, y: pos.y,
       r: CHAR_FOOT_R, hp: 30, maxHp: 30,
       speed: 30, // r and speed scaled down along with TILE, see note above
+      speedMul: 1, // unarmed — no weapon-weight penalty
       alive: true,
       type: 'zombie',
       wanderAngle, wanderTimer: 0,
@@ -4678,27 +4690,40 @@
           e.facing = a;
           e.moving = true;
           if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
-          e.x += Math.cos(a)*e.speed*dt;
-          e.y += Math.sin(a)*e.speed*dt;
-          e.shotCd -= dt;
-          if(distToPlayer < 300 && e.shotCd<=0){
-            const wd = e.weaponDef;
-            // Floor the cooldown — an enemy rolling the minigun's raw 3000rpm
-            // cooldown would fire dozens of times a second; clamped so "that
-            // guy has a minigun" reads as dangerous, not instant death.
-            e.shotCd = Math.max(0.15, wd.cooldown);
-            const pelletCount = wd.pellets || 1;
-            const wdWallRetention = WALL_PENETRATION_BY_AMMO[wd.ammoType] !== undefined
-              ? WALL_PENETRATION_BY_AMMO[wd.ammoType]
-              : WALL_PENETRATION_RETENTION_PER_M;
-            // Aim, don't laser-target: `a` (used for movement/facing above)
-            // stays exact, but the actual shot gets its own random cone of
-            // error on top of the weapon's own spread.
-            const fireAngle = a + (Math.random()-0.5)*ENEMY_AIM_ERROR;
-            for(let p=0; p<pelletCount; p++){
-              fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
+          e.x += Math.cos(a)*e.speed*e.speedMul*dt;
+          e.y += Math.sin(a)*e.speed*e.speedMul*dt;
+          const wd = e.weaponDef;
+          if(e.reloading){
+            e.reloadTimer -= dt;
+            if(e.reloadTimer<=0){ e.reloading = false; e.ammo = e.magSize; }
+          } else {
+            e.shotCd -= dt;
+            if(distToPlayer < 300 && e.shotCd<=0 && e.ammo>0){
+              // Floor the cooldown — an enemy rolling the minigun's raw 3000rpm
+              // cooldown would fire dozens of times a second; clamped so "that
+              // guy has a minigun" reads as dangerous, not instant death.
+              e.shotCd = Math.max(0.15, wd.cooldown);
+              e.ammo -= 1;
+              const pelletCount = wd.pellets || 1;
+              const wdWallRetention = WALL_PENETRATION_BY_AMMO[wd.ammoType] !== undefined
+                ? WALL_PENETRATION_BY_AMMO[wd.ammoType]
+                : WALL_PENETRATION_RETENTION_PER_M;
+              // Aim, don't laser-target: `a` (used for movement/facing above)
+              // stays exact, but the actual shot gets its own random cone of
+              // error on top of the weapon's own spread.
+              const fireAngle = a + (Math.random()-0.5)*ENEMY_AIM_ERROR;
+              for(let p=0; p<pelletCount; p++){
+                fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
+              }
+              emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
+              // Magazine empty — same reload downtime the player eats, no
+              // free pass. A high-capacity/belt-fed roll (magSize in the
+              // hundreds) just means this essentially never comes up.
+              if(e.ammo<=0){
+                e.reloading = true;
+                e.reloadTimer = wd.reloadTime || 1.5;
+              }
             }
-            emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
           }
         } else {
           e.wanderTimer -= dt;
@@ -4709,8 +4734,8 @@
           e.moving = true;
           e.facing = e.wanderAngle;
           if(Math.abs(Math.cos(e.wanderAngle)) > 0.01) e.facingRight = Math.cos(e.wanderAngle) >= 0;
-          e.x += Math.cos(e.wanderAngle)*e.speed*0.4*dt;
-          e.y += Math.sin(e.wanderAngle)*e.speed*0.4*dt;
+          e.x += Math.cos(e.wanderAngle)*e.speed*e.speedMul*0.4*dt;
+          e.y += Math.sin(e.wanderAngle)*e.speed*e.speedMul*0.4*dt;
         }
         advanceAnim(e.anim, e.moving, dt);
       }
