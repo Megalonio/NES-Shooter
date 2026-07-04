@@ -110,15 +110,15 @@
       quads.forEach(q=> q.d2 = (q.cx-player.x)**2+(q.cy-player.y)**2);
       quads.sort((a,b)=> b.d2 - a.d2);
 
-      const S = 64;
       for(const q of quads){
         const [p0,p1,p2,p3] = q.p;
         const pa=project(...p0), pb=project(...p1), pcc=project(...p2), pd=project(...p3);
         if(!pa||!pb||!pcc||!pd) continue;
         const dist = Math.sqrt(q.d2);
         const shade = Math.max(0.2, 1-dist/(TILE*16));
-        drawTexTri(q.tex, 0,0, S,0, 0,S, pa.x,pa.y, pb.x,pb.y, pd.x,pd.y);
-        drawTexTri(q.tex, S,0, S,S, 0,S, pb.x,pb.y, pcc.x,pcc.y, pd.x,pd.y);
+        const SW = q.tex.naturalWidth || q.tex.width, SH = q.tex.naturalHeight || q.tex.height;
+        drawTexTri(q.tex, 0,0, SW,0, 0,SH, pa.x,pa.y, pb.x,pb.y, pd.x,pd.y);
+        drawTexTri(q.tex, SW,0, SW,SH, 0,SH, pb.x,pb.y, pcc.x,pcc.y, pd.x,pd.y);
         if(shade<1){
           ctx.fillStyle = `rgba(0,0,0,${(1-shade)*0.75})`;
           ctx.beginPath();
