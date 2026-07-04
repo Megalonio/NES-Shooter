@@ -1435,7 +1435,8 @@
     // images side by side). The single 10.png is only used when a hit's
     // rounded damage is exactly 10, same as any other digit image.
     ui: {
-      numbers: Array.from({length:11}, (_,i)=>`ui/${i}.png`)
+      numbers: Array.from({length:11}, (_,i)=>`ui/${i}.png`),
+      aggro: 'ui/aggro.png' // shown floating over an enemy's head while alerted (chase/investigate/sweep), same spot a "!"/aggro icon sits in most top-down shooters
     }
   };
 
@@ -1988,6 +1989,7 @@
   loadTex('zombie',       TEXTURES.zombie);
   loadTex('weaponSheet', TEXTURES.weaponSheet);
   TEXTURES.ui.numbers.forEach((url,i)=> loadTex('ui.number'+i, url));
+  loadTex('ui.aggro', TEXTURES.ui.aggro);
 
   // ---------------- Character animation: idle/walk only ----------------
   // Survivors (the player) are drawn as a random pick from every non-orc
@@ -3120,7 +3122,10 @@
       alive: true,
       wanderAngle, wanderTimer: 0,
       facing: wanderAngle, // which way they're currently looking — see ENEMY_VIEW_ARC_HALF below, can't detect the player behind them
-      aware: false,        // once they've spotted the player through the facing cone, LOS alone keeps them locked on — losing LOS resets this, requiring the cone check again to re-spot
+      aware: false,        // once they've spotted the player through the facing cone, LOS alone keeps them locked on through chase/investigate/sweep — only cleared when sweep gives up, requiring the cone check again to re-spot
+      alertState: 'idle',  // 'idle' (wander) -> 'chase' (has LOS) -> 'investigate' (lost LOS, pathing to last seen spot) -> 'sweep' (lingering/looking around) -> back to 'idle'
+      lastSeenX: 0, lastSeenY: 0,
+      investigateTimer: 0, sweepTimer: 0, sweepDir: 1, reactionShootTimer: 0,
       shotCd: 0,
       ammo: wd.magSize, magSize: wd.magSize, reloading: false, reloadTimer: 0, // same magazine/reload limits the player lives with — see the reload branch below
       soundTimer: 0,    // footstep-sound cooldown, only ticks a pulse while hidden from the player
@@ -3227,6 +3232,19 @@
   // of error added on top. Wider than the player would ever want, since
   // that's what actually reads as "a person shooting at you," not a hitscan.
   const ENEMY_AIM_ERROR = 0.28; // ~16 degrees of random aim error, radians
+
+  // ---- Post-LOS behavior: losing sight of the player doesn't mean an
+  // enemy forgets about them instantly. They path to wherever they last
+  // saw the player (INVESTIGATE_TIME caps how long they'll try, in case
+  // that spot is unreachable), optionally taking a shot or two at that
+  // spot right as they lose you (REACTION_SHOOT_WINDOW — they're still
+  // reacting to where you just were), then linger and look around
+  // (SWEEP_TIME) before fully giving up and going back to idle wandering.
+  const INVESTIGATE_TIME = 4;
+  const SWEEP_TIME = 2.5;
+  const REACTION_SHOOT_WINDOW = 1.2;
+  const INVESTIGATE_ARRIVE_DIST = 12;
+  const SWEEP_TURN_SPEED = 1.4; // rad/s, facing sweeps back and forth while lingering
   function pickForestSpawn(){
     if(FOREST_FLOOR.length) return FOREST_FLOOR[Math.floor(Math.random()*FOREST_FLOOR.length)];
     return pickHouseSpawn(); // fallback if a map ever rolls no forest at all
@@ -3244,6 +3262,9 @@
       wanderAngle, wanderTimer: 0,
       facing: wanderAngle, // see ENEMY_VIEW_ARC_HALF below — can't detect the player directly behind them
       aware: false,
+      alertState: 'idle',
+      lastSeenX: 0, lastSeenY: 0,
+      investigateTimer: 0, sweepTimer: 0, sweepDir: 1,
       meleeCd: 0,
       soundTimer: 0,
       weaponDef: null, // no gun — never drops anything on death
@@ -4628,8 +4649,10 @@
         const toPlayerAngle = Math.atan2(player.y-e.y, player.x-e.x);
         const rawLOS = distToPlayer < ZOMBIE_DETECT_RANGE && canSee(e.x, e.y, player.x, player.y, ZOMBIE_DETECT_RANGE);
         const hasLOS = rawLOS && (e.aware || inFacingCone(e.facing, toPlayerAngle));
-        e.aware = hasLOS;
         if(hasLOS){
+          e.aware = true;
+          if(e.alertState !== 'chase'){ e.alertState = 'chase'; }
+          e.lastSeenX = player.x; e.lastSeenY = player.y;
           const a = toPlayerAngle;
           e.facing = a;
           const contactDist = e.r + player.r + 4;
@@ -4655,6 +4678,37 @@
             }
             player.hp = Math.max(0, player.hp - dmg);
             if(player.hp<=0) respawnPlayer();
+          }
+        } else if(e.alertState === 'chase'){
+          // Just lost sight of the player — instead of forgetting them
+          // instantly, go find out where they went.
+          e.alertState = 'investigate';
+          e.investigateTimer = INVESTIGATE_TIME;
+        } else if(e.alertState === 'investigate'){
+          const dx = e.lastSeenX-e.x, dy = e.lastSeenY-e.y;
+          const distToLast = Math.hypot(dx,dy);
+          e.investigateTimer -= dt;
+          if(distToLast > INVESTIGATE_ARRIVE_DIST && e.investigateTimer > 0){
+            const a = Math.atan2(dy,dx);
+            e.facing = a;
+            e.moving = true;
+            if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
+            e.x += Math.cos(a)*e.speed*dt;
+            e.y += Math.sin(a)*e.speed*dt;
+          } else {
+            // Arrived at (or gave up reaching) the last known spot — linger
+            // and look around a bit before fully giving up the chase.
+            e.alertState = 'sweep';
+            e.sweepTimer = SWEEP_TIME;
+            e.sweepDir = Math.random()<0.5 ? -1 : 1;
+          }
+        } else if(e.alertState === 'sweep'){
+          e.sweepTimer -= dt;
+          e.facing += e.sweepDir*SWEEP_TURN_SPEED*dt;
+          e.moving = false;
+          if(e.sweepTimer <= 0){
+            e.alertState = 'idle';
+            e.aware = false;
           }
         } else {
           e.wanderTimer -= dt;
@@ -4684,46 +4738,98 @@
         const toPlayerAngle = Math.atan2(player.y-e.y, player.x-e.x);
         const rawLOS = isOnScreen(e.x, e.y, e.r) && distToPlayer < 320 && canSee(e.x, e.y, player.x, player.y, 320);
         const enemyHasLOS = rawLOS && (e.aware || inFacingCone(e.facing, toPlayerAngle));
-        e.aware = enemyHasLOS;
+        const wd = e.weaponDef;
+        // Reload can finish in any state (chase, investigate, sweep) — a
+        // gunman shouldn't freeze mid-reload just because they lost you.
+        if(e.reloading){
+          e.reloadTimer -= dt;
+          if(e.reloadTimer<=0){ e.reloading = false; e.ammo = e.magSize; }
+        }
+        function fireEnemyShotAt(targetAngle){
+          e.shotCd = Math.max(0.15, wd.cooldown);
+          e.ammo -= 1;
+          const pelletCount = wd.pellets || 1;
+          const wdWallRetention = WALL_PENETRATION_BY_AMMO[wd.ammoType] !== undefined
+            ? WALL_PENETRATION_BY_AMMO[wd.ammoType]
+            : WALL_PENETRATION_RETENTION_PER_M;
+          const fireAngle = targetAngle + (Math.random()-0.5)*ENEMY_AIM_ERROR;
+          for(let p=0; p<pelletCount; p++){
+            fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
+          }
+          emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
+          // Magazine empty — same reload downtime the player eats, no free
+          // pass. A high-capacity/belt-fed roll (magSize in the hundreds)
+          // just means this essentially never comes up.
+          if(e.ammo<=0){
+            e.reloading = true;
+            e.reloadTimer = wd.reloadTime || 1.5;
+          }
+        }
         if(enemyHasLOS){
+          e.aware = true;
+          e.alertState = 'chase';
+          e.lastSeenX = player.x; e.lastSeenY = player.y;
           const a = toPlayerAngle;
           e.facing = a;
           e.moving = true;
           if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
           e.x += Math.cos(a)*e.speed*e.speedMul*dt;
           e.y += Math.sin(a)*e.speed*e.speedMul*dt;
-          const wd = e.weaponDef;
-          if(e.reloading){
-            e.reloadTimer -= dt;
-            if(e.reloadTimer<=0){ e.reloading = false; e.ammo = e.magSize; }
-          } else {
+          if(!e.reloading){
             e.shotCd -= dt;
             if(distToPlayer < 300 && e.shotCd<=0 && e.ammo>0){
               // Floor the cooldown — an enemy rolling the minigun's raw 3000rpm
               // cooldown would fire dozens of times a second; clamped so "that
               // guy has a minigun" reads as dangerous, not instant death.
-              e.shotCd = Math.max(0.15, wd.cooldown);
-              e.ammo -= 1;
-              const pelletCount = wd.pellets || 1;
-              const wdWallRetention = WALL_PENETRATION_BY_AMMO[wd.ammoType] !== undefined
-                ? WALL_PENETRATION_BY_AMMO[wd.ammoType]
-                : WALL_PENETRATION_RETENTION_PER_M;
               // Aim, don't laser-target: `a` (used for movement/facing above)
               // stays exact, but the actual shot gets its own random cone of
               // error on top of the weapon's own spread.
-              const fireAngle = a + (Math.random()-0.5)*ENEMY_AIM_ERROR;
-              for(let p=0; p<pelletCount; p++){
-                fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
-              }
-              emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
-              // Magazine empty — same reload downtime the player eats, no
-              // free pass. A high-capacity/belt-fed roll (magSize in the
-              // hundreds) just means this essentially never comes up.
-              if(e.ammo<=0){
-                e.reloading = true;
-                e.reloadTimer = wd.reloadTime || 1.5;
+              fireEnemyShotAt(a);
+            }
+          }
+        } else if(e.alertState === 'chase'){
+          // Just lost sight of the player — path to where they were last
+          // seen instead of forgetting about them outright, keeping a
+          // brief reaction window to still snap off a shot or two at that
+          // spot, like they're still reacting to where the player just was.
+          e.alertState = 'investigate';
+          e.investigateTimer = INVESTIGATE_TIME;
+          e.reactionShootTimer = REACTION_SHOOT_WINDOW;
+        } else if(e.alertState === 'investigate'){
+          const dx = e.lastSeenX-e.x, dy = e.lastSeenY-e.y;
+          const distToLast = Math.hypot(dx,dy);
+          const aToLast = Math.atan2(dy,dx);
+          e.investigateTimer -= dt;
+          if(e.reactionShootTimer > 0){
+            e.reactionShootTimer -= dt;
+            if(!e.reloading){
+              e.shotCd -= dt;
+              if(distToLast < 300 && e.shotCd<=0 && e.ammo>0 && canSee(e.x, e.y, e.lastSeenX, e.lastSeenY, 320)){
+                fireEnemyShotAt(aToLast);
               }
             }
+          }
+          if(distToLast > INVESTIGATE_ARRIVE_DIST && e.investigateTimer > 0){
+            e.facing = aToLast;
+            e.moving = true;
+            if(Math.abs(Math.cos(aToLast)) > 0.01) e.facingRight = Math.cos(aToLast) >= 0;
+            e.x += Math.cos(aToLast)*e.speed*e.speedMul*dt;
+            e.y += Math.sin(aToLast)*e.speed*e.speedMul*dt;
+          } else if(e.investigateTimer <= 0 || distToLast <= INVESTIGATE_ARRIVE_DIST){
+            // Arrived at (or gave up reaching) the last known spot — linger
+            // and look around a bit before fully giving up the chase.
+            e.alertState = 'sweep';
+            e.sweepTimer = SWEEP_TIME;
+            e.sweepDir = Math.random()<0.5 ? -1 : 1;
+            e.moving = false;
+          }
+        } else if(e.alertState === 'sweep'){
+          e.sweepTimer -= dt;
+          e.facing += e.sweepDir*SWEEP_TURN_SPEED*dt;
+          e.moving = false;
+          if(e.sweepTimer <= 0){
+            e.alertState = 'idle';
+            e.aware = false;
           }
         } else {
           e.wanderTimer -= dt;
@@ -5211,6 +5317,21 @@
   }
 
 
+  // Little floating icon over an enemy's head while they're alerted —
+  // covers all three "knows about you" states (chase/investigate/sweep),
+  // not just active chase, so it reads as "still on to you" right up until
+  // they actually give up and go back to idle wandering. Bobs gently so it
+  // doesn't sit dead-still, and fades out gracefully if the art hasn't
+  // loaded yet (same degrade-gracefully pattern as every other texture).
+  const AGGRO_BOB_SPEED = 4, AGGRO_BOB_AMOUNT = 2;
+  function drawAggroIcon(e){
+    const img = getTex('ui.aggro');
+    if(!img) return;
+    const w = img.width, h = img.height;
+    const bob = Math.sin(performance.now()/1000*AGGRO_BOB_SPEED + e.x) * AGGRO_BOB_AMOUNT;
+    ctx.drawImage(img, e.x - w/2, e.y - e.r - h - 6 + bob, w, h);
+  }
+
   function drawFog(){
     if(!fogOfWarEnabled) return;
     // Only sweep the tiles actually on screen — same idea as drawTiles()'s
@@ -5360,6 +5481,10 @@
         } else {
           drawCharacter(e.x, e.y, e.r, undefined, '#e2533c', '#3a1a14', getTex('zombie'), getAnimFrame('survivor', e.survivor, e.anim), e.facingRight);
         }
+        // Alerted (chase/investigate/sweep) — shown until they fully give
+        // up and drop back to idle wandering, not just while actively
+        // chasing, so it also covers the "looking for you" in-between.
+        if(e.alertState && e.alertState !== 'idle') drawAggroIcon(e);
       }
     }
     drawFog();
