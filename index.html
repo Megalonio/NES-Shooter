@@ -1255,6 +1255,98 @@
   }
   rebuildCollisionCaches();
 
+  // ---- Enemy pathfinding: a plain BFS over the tile grid, used so an
+  // investigating/sweeping enemy actually routes around walls to reach the
+  // player's last known position instead of just walking straight at a
+  // point it can never get to in a straight line (and getting stuck
+  // pressed against a wall). Same solid rules as physical movement — see
+  // rebuildCollisionCaches above — walls, water, trees, and unbroken
+  // windows all block a tile. This is deliberately not full A* (no
+  // distance heuristic) since these grids are small enough that plain BFS
+  // finishes fast, and it's only called when a target actually changes,
+  // not every frame.
+  function tileBlockedForPath(col, row){
+    if(row<0 || row>=ROWS || col<0 || col>=COLS) return true;
+    const ch = MAP[row][col];
+    if(ch==='#' || ch==='~' || ch==='T') return true;
+    if(ch==='V'){
+      const w = windowGrid.get(row*COLS+col);
+      if(w && !w.broken) return true; // an already-broken window is just an open gap
+    }
+    return false;
+  }
+  const PATH_MAX_NODES = 4000; // safety cap — an unreachable target (e.g. across water with no bridge) gives up rather than scanning the whole map
+  const PATH_DIRS = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+  function findPath(fromX, fromY, toX, toY){
+    const startCol = Math.floor(fromX/TILE), startRow = Math.floor(fromY/TILE);
+    const goalCol = Math.floor(toX/TILE), goalRow = Math.floor(toY/TILE);
+    if(tileBlockedForPath(goalCol, goalRow)) return null;
+    const key = (c,r) => r*COLS+c;
+    const startKey = key(startCol,startRow), goalKey = key(goalCol,goalRow);
+    if(startKey === goalKey) return [];
+    const cameFrom = new Map();
+    const visited = new Set([startKey]);
+    const queue = [[startCol,startRow]];
+    let qi = 0, found = false;
+    while(qi < queue.length && qi < PATH_MAX_NODES){
+      const [c,r] = queue[qi++];
+      if(c===goalCol && r===goalRow){ found = true; break; }
+      for(const [dc,dr] of PATH_DIRS){
+        const nc = c+dc, nr = r+dr;
+        if(tileBlockedForPath(nc,nr)) continue;
+        // don't let a diagonal step cut through a solid corner
+        if(dc!==0 && dr!==0 && (tileBlockedForPath(c+dc,r) || tileBlockedForPath(c,r+dr))) continue;
+        const nk = key(nc,nr);
+        if(visited.has(nk)) continue;
+        visited.add(nk);
+        cameFrom.set(nk, key(c,r));
+        queue.push([nc,nr]);
+      }
+    }
+    if(!found) return null;
+    let curKey = goalKey;
+    const pathKeys = [curKey];
+    while(curKey !== startKey){
+      curKey = cameFrom.get(curKey);
+      if(curKey===undefined) return null; // shouldn't happen once found=true, but bail safely rather than crash
+      pathKeys.push(curKey);
+    }
+    pathKeys.reverse();
+    return pathKeys.map(k => ({x: (k%COLS)*TILE + TILE/2, y: Math.floor(k/COLS)*TILE + TILE/2}));
+  }
+
+  // Moves an investigating/sweeping enemy one step along its path toward
+  // e.lastSeenX/Y (computing or refreshing that path first if it's stale —
+  // see findPath above), advancing to the next waypoint once close enough
+  // to the current one. Falls back to walking straight at the target if no
+  // path could be found (e.g. it's genuinely unreachable) rather than just
+  // freezing. Returns true once the enemy has actually arrived at the
+  // final target, so callers know to switch into 'sweep'.
+  function advanceInvestigatePath(e, dt, speed){
+    if(!e.path || e.pathTargetX !== e.lastSeenX || e.pathTargetY !== e.lastSeenY){
+      e.path = findPath(e.x, e.y, e.lastSeenX, e.lastSeenY);
+      e.pathIndex = 0;
+      e.pathTargetX = e.lastSeenX; e.pathTargetY = e.lastSeenY;
+    }
+    const distFinal = Math.hypot(e.lastSeenX-e.x, e.lastSeenY-e.y);
+    if(distFinal <= INVESTIGATE_ARRIVE_DIST) return true;
+    let moveAngle = Math.atan2(e.lastSeenY-e.y, e.lastSeenX-e.x); // fallback: straight line, used only if pathfinding couldn't find a route at all
+    if(e.path && e.path.length){
+      let wp = e.path[e.pathIndex];
+      while(wp && Math.hypot(wp.x-e.x, wp.y-e.y) < INVESTIGATE_ARRIVE_DIST && e.pathIndex < e.path.length-1){
+        e.pathIndex++;
+        wp = e.path[e.pathIndex];
+      }
+      if(wp) moveAngle = Math.atan2(wp.y-e.y, wp.x-e.x);
+    }
+    e.facing = moveAngle;
+    e.moving = true;
+    if(Math.abs(Math.cos(moveAngle)) > 0.01) e.facingRight = Math.cos(moveAngle) >= 0;
+    e.x += Math.cos(moveAngle)*speed*dt;
+    e.y += Math.sin(moveAngle)*speed*dt;
+    return false;
+  }
+
   // ---- second pass: give every wall tile that faces open space below it
   // a 3-tall "face" strip (the wall's visual side/depth) — this includes
   // straight horizontal runs AND the corner pieces that end one (a corner
@@ -3126,6 +3218,7 @@
       alertState: 'idle',  // 'idle' (wander) -> 'chase' (has LOS) -> 'investigate' (lost LOS, pathing to last seen spot) -> 'sweep' (lingering/looking around) -> back to 'idle'
       lastSeenX: 0, lastSeenY: 0,
       investigateTimer: 0, sweepTimer: 0, sweepDir: 1, reactionShootTimer: 0,
+      path: null, pathIndex: 0, pathTargetX: null, pathTargetY: null,
       shotCd: 0,
       ammo: wd.magSize, magSize: wd.magSize, reloading: false, reloadTimer: 0, // same magazine/reload limits the player lives with — see the reload branch below
       soundTimer: 0,    // footstep-sound cooldown, only ticks a pulse while hidden from the player
@@ -3265,6 +3358,7 @@
       alertState: 'idle',
       lastSeenX: 0, lastSeenY: 0,
       investigateTimer: 0, sweepTimer: 0, sweepDir: 1,
+      path: null, pathIndex: 0, pathTargetX: null, pathTargetY: null,
       meleeCd: 0,
       soundTimer: 0,
       weaponDef: null, // no gun — never drops anything on death
@@ -4755,22 +4849,16 @@
           e.alertState = 'investigate';
           e.investigateTimer = INVESTIGATE_TIME;
         } else if(e.alertState === 'investigate'){
-          const dx = e.lastSeenX-e.x, dy = e.lastSeenY-e.y;
-          const distToLast = Math.hypot(dx,dy);
           e.investigateTimer -= dt;
-          if(distToLast > INVESTIGATE_ARRIVE_DIST && e.investigateTimer > 0){
-            const a = Math.atan2(dy,dx);
-            e.facing = a;
-            e.moving = true;
-            if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
-            e.x += Math.cos(a)*e.speed*dt;
-            e.y += Math.sin(a)*e.speed*dt;
-          } else {
+          const arrived = advanceInvestigatePath(e, dt, e.speed);
+          if(arrived || e.investigateTimer <= 0){
             // Arrived at (or gave up reaching) the last known spot — linger
             // and look around a bit before fully giving up the chase.
             e.alertState = 'sweep';
             e.sweepTimer = SWEEP_TIME;
             e.sweepDir = Math.random()<0.5 ? -1 : 1;
+            e.moving = false;
+            e.path = null;
           }
         } else if(e.alertState === 'sweep'){
           e.sweepTimer -= dt;
@@ -4846,9 +4934,8 @@
           e.investigateTimer = INVESTIGATE_TIME;
           e.reactionShootTimer = REACTION_SHOOT_WINDOW;
         } else if(e.alertState === 'investigate'){
-          const dx = e.lastSeenX-e.x, dy = e.lastSeenY-e.y;
-          const distToLast = Math.hypot(dx,dy);
-          const aToLast = Math.atan2(dy,dx);
+          const distToLast = Math.hypot(e.lastSeenX-e.x, e.lastSeenY-e.y);
+          const aToLast = Math.atan2(e.lastSeenY-e.y, e.lastSeenX-e.x);
           e.investigateTimer -= dt;
           if(e.reactionShootTimer > 0){
             e.reactionShootTimer -= dt;
@@ -4859,19 +4946,15 @@
               }
             }
           }
-          if(distToLast > INVESTIGATE_ARRIVE_DIST && e.investigateTimer > 0){
-            e.facing = aToLast;
-            e.moving = true;
-            if(Math.abs(Math.cos(aToLast)) > 0.01) e.facingRight = Math.cos(aToLast) >= 0;
-            e.x += Math.cos(aToLast)*e.speed*e.speedMul*dt;
-            e.y += Math.sin(aToLast)*e.speed*e.speedMul*dt;
-          } else if(e.investigateTimer <= 0 || distToLast <= INVESTIGATE_ARRIVE_DIST){
+          const arrived = advanceInvestigatePath(e, dt, e.speed*e.speedMul);
+          if(arrived || e.investigateTimer <= 0){
             // Arrived at (or gave up reaching) the last known spot — linger
             // and look around a bit before fully giving up the chase.
             e.alertState = 'sweep';
             e.sweepTimer = SWEEP_TIME;
             e.sweepDir = Math.random()<0.5 ? -1 : 1;
             e.moving = false;
+            e.path = null;
           }
         } else if(e.alertState === 'sweep'){
           e.sweepTimer -= dt;
