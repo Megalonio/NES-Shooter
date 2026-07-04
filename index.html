@@ -3882,13 +3882,33 @@
     entity.y = Math.max(entity.r, Math.min(WORLD_H-entity.r, entity.y));
   }
 
-  // A brief burst of particles at the point a bullet actually strikes
-  // something solid — separate from the tracer, this is what sells "that
-  // shot just hit a wall" rather than the round simply vanishing.
+  // Multiple hits landing on the same enemy in the same frame (a shotgun's
+  // 8-9 pellets, most obviously) used to each spawn their own tiny number —
+  // a wall of "5 5 5 5 5" that's unreadable at a glance. Instead, damage is
+  // accumulated per-enemy here and flushed into ONE combined number
+  // (Apex-Legends-style) right at the start of the next update() tick —
+  // i.e. covering everything that happened since the previous flush,
+  // whether from the bullet loop, a melee swing, or anything else.
+  const hitAccum = new Map(); // enemy object -> {amount, x, y, r}
+  function accumulateHitNumber(e, amount){
+    let p = hitAccum.get(e);
+    if(!p){ p = {amount:0, x:e.x, y:e.y, r:e.r}; hitAccum.set(e, p); }
+    p.amount += amount;
+    p.x = e.x; p.y = e.y; p.r = e.r; // keep the freshest position in case the enemy moved between hits
+  }
+  function flushHitAccum(){
+    for(const p of hitAccum.values()){
+      spawnHitNumber(p.x, p.y - p.r, p.amount);
+    }
+    hitAccum.clear();
+  }
+
   // A floating damage number that pops up where a hit landed and drifts
   // upward while fading — classic action-RPG "hit number" feedback.
   // Amount is rounded to a whole number and spelled out digit-by-digit
-  // using the ui/#.png glyphs (see TEXTURES.ui.numbers).
+  // using the ui/#.png glyphs (see TEXTURES.ui.numbers). Called from
+  // flushHitAccum() above, not directly from hit-detection code — see
+  // accumulateHitNumber().
   function spawnHitNumber(x, y, amount){
     const rounded = Math.max(0, Math.round(amount));
     hitNumbers.push({
@@ -3969,7 +3989,7 @@
         const a = Math.atan2(e.y-player.y, e.x-player.x);
         if(Math.abs(angleDiff(a, angle)) <= mw.arc/2){
           e.hp -= mw.damage;
-          spawnHitNumber(e.x, e.y - e.r, mw.damage);
+          accumulateHitNumber(e, mw.damage);
           // small knockback along the swing direction
           e.x += Math.cos(angle)*10;
           e.y += Math.sin(angle)*10;
@@ -4052,6 +4072,11 @@
   }
 
   function update(dt){
+    // Combine and pop any damage-number hits accumulated since the last
+    // tick into single merged numbers — see accumulateHitNumber/
+    // flushHitAccum above for why this isn't just spawned immediately.
+    flushHitAccum();
+
     // ---- screen-scroll transition freeze ----
     // While the camera is mid-pan between sectors, the whole simulation
     // freezes — player input, enemy AI, bullets, everything — and only the
@@ -4369,7 +4394,7 @@
             if(!e.alive) continue;
             if(Math.hypot(b.x-e.x, b.y-e.y) < e.r){
               e.hp -= liveDmg;
-              spawnHitNumber(e.x, e.y - e.r, liveDmg);
+              accumulateHitNumber(e, liveDmg);
               dead = true;
               spawnImpact(b.x, b.y, 'flesh');
               if(e.hp<=0){
@@ -4954,18 +4979,24 @@
 
   // Floating damage numbers: each digit is drawn from its own ui/#.png
   // glyph at its native pixel size (these are 16x16 source images), laid
-  // out side by side and centered above the hit point. Falls back to
+  // out side by side and centered above the hit point. The source glyphs
+  // have some transparent padding baked in, so drawing them fully
+  // edge-to-edge (advancing by the full 16px each time) leaves distracting
+  // gaps between digits — DIGIT_KERN pulls each next glyph in closer to
+  // compensate, without touching the glyphs' own drawn size. Falls back to
   // nothing (silently skipped) for any digit whose image hasn't loaded
   // yet, same "degrade gracefully" pattern as every other texture slot in
   // this file.
+  const DIGIT_KERN = 0.6; // fraction of glyph width advanced per digit — tune to taste
   function drawHitNumbers(){
     for(const n of hitNumbers){
       const frac = 1 - n.age/n.life;
       const alpha = Math.min(1, frac*1.4); // holds near-full opacity, then fades fast at the very end
       const scale = 0.8 + Math.min(1, n.age/0.12)*0.2; // tiny pop-in grow over the first ~0.12s
 
-      // measure total width first so the whole string can be centered —
-      // native size, no resizing beyond the small pop-in scale above
+      // measure total advance width first so the whole string can be
+      // centered — native glyph size, no resizing beyond the small pop-in
+      // scale above, just tighter spacing between glyphs (see DIGIT_KERN)
       const glyphs = [];
       let totalW = 0;
       for(const ch of n.text){
@@ -4973,15 +5004,15 @@
         if(!img){ glyphs.push(null); continue; }
         const w = img.width*scale, h = img.height*scale;
         glyphs.push({img, w, h});
-        totalW += w;
+        totalW += w*DIGIT_KERN;
       }
+      totalW += glyphs.length ? glyphs[glyphs.length-1].w*(1-DIGIT_KERN) : 0; // last glyph's full width, not just its advance
       let dx = n.x - totalW/2;
       ctx.save();
       ctx.globalAlpha = alpha;
       for(const g of glyphs){
         if(g) ctx.drawImage(g.img, dx, n.y - g.h/2, g.w, g.h);
-        else dx += 8; // missing glyph — leave a placeholder gap instead of crushing the rest together
-        if(g) dx += g.w;
+        dx += g ? g.w*DIGIT_KERN : 8; // missing glyph — leave a placeholder gap instead of crushing the rest together
       }
       ctx.restore();
     }
