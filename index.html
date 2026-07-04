@@ -1299,6 +1299,16 @@
     return MAP[row][col] === 'S';
   }
 
+  // Which footstep-sound surface a world position belongs to. There's no
+  // stone floor tile in the map generator yet, but the 'stone' branch is
+  // wired up ahead of time (see FOOTSTEP_FILES below) so adding stone
+  // floors later is just a MAP char + a check here.
+  function surfaceAt(px, py){
+    if(isOnSand(px, py)) return 'sand';
+    if(isIndoors(px, py)) return 'wood';
+    return 'grass';
+  }
+
   // ---------------- Bullet ballistics: drag & penetration ----------------
   // Retention factors are "fraction of velocity kept per 1 tile (1m) traveled".
   // Open air barely slows a pistol round over a map this size — the loss here
@@ -3122,10 +3132,65 @@
     // from where they happen, not through this shared event)
     if(kind === 'shot') playGunshot(x, y, false);
     else if(kind === 'break') playGlassBreak(x, y);
-    else if(kind === 'move') playFootstep(x, y, maxDist, undefined, isIndoors(x,y));
+    else if(kind === 'move') playFootstep(x, y, maxDist, undefined, surfaceAt(x,y));
   }
 
-  // ---------------- Audio: synthesized sound effects ----------------
+  // ---------------- Audio: recorded sound effects ----------------
+  // Gunshots and footsteps now play real .ogg files from audio/ instead of
+  // being synthesized. Each sound gets a small pool of <audio> elements so
+  // overlapping plays (e.g. two footsteps in quick succession, or a fast
+  // weapon) don't cut each other off the way a single reused element would.
+  const SHOT_FILES = ['a','b','c','d','e','f','g','h'].map(l=>`audio/shoot-${l}.ogg`);
+  // shoot-c is used for every weapon, per current sound design — the array
+  // above is kept around in case per-weapon variety gets added later.
+  const GUNSHOT_FILE = 'audio/shoot-c.ogg';
+  const FOOTSTEP_FILES = {
+    grass: 'audio/move-b.ogg',
+    sand:  'audio/move-a.ogg',
+    wood:  'audio/move-d.ogg',
+    stone: 'audio/move-c.ogg', // no stone floors yet, wired up for when they exist
+  };
+  const AUDIO_POOL_SIZE = 6;
+  const audioPools = {}; // src -> {els:[HTMLAudioElement...], next:0}
+  function getPooledAudio(src){
+    let pool = audioPools[src];
+    if(!pool){
+      pool = {els: [], next: 0};
+      for(let i=0;i<AUDIO_POOL_SIZE;i++){
+        const el = new Audio(src);
+        el.preload = 'auto';
+        pool.els.push(el);
+      }
+      audioPools[src] = pool;
+    }
+    const el = pool.els[pool.next];
+    pool.next = (pool.next+1) % pool.els.length;
+    return el;
+  }
+  function playFile(src, vol, pan){
+    if(audioMuted) return;
+    const el = getPooledAudio(src);
+    try{
+      el.currentTime = 0;
+      el.volume = Math.max(0, Math.min(1, vol));
+      // Stereo pan on plain <audio> elements needs a Web Audio pan node,
+      // which requires the shared AudioContext to exist and each element to
+      // be routed through it exactly once — cache that per-element the
+      // first time we see it, then just move the pan value on repeat plays.
+      if(actx && pan!==undefined){
+        if(!el._panner){
+          const src0 = actx.createMediaElementSource(el);
+          el._panner = actx.createStereoPanner ? actx.createStereoPanner() : null;
+          if(el._panner){ src0.connect(el._panner); el._panner.connect(actx.destination); }
+          else src0.connect(actx.destination);
+        }
+        if(el._panner) el._panner.pan.value = Math.max(-1, Math.min(1, pan));
+      }
+      el.play().catch(()=>{});
+    }catch(e){}
+  }
+
+  // ---------------- Audio: synthesized sound effects (legacy) ----------------
   // No external sound files — every effect below is generated on the fly
   // with the Web Audio API (oscillators + filtered noise) so the whole game
   // stays a single self-contained file. Sounds are positioned relative to
@@ -3205,92 +3270,20 @@
   // Friendly (player) shots get a touch more low-end punch since you're
   // right on top of the source; enemy shots read a bit thinner/further.
   function playGunshot(x, y, friendly){
-    if(!actx || audioMuted) return;
     const {vol, pan} = friendly ? {vol:1, pan:0} : spatial(x, y, SOUND_RANGE.shot*0.35);
     if(vol<=0.01) return;
-    const t = actx.currentTime;
-    const panner = actx.createStereoPanner ? actx.createStereoPanner() : null;
-    const out = panner || masterGain;
-    if(panner){ panner.pan.value = pan; panner.connect(masterGain); }
-
-    // crack — bandpassed noise burst
-    const noise = makeNoise(0.18);
-    const bp = actx.createBiquadFilter();
-    bp.type = 'bandpass';
-    bp.frequency.value = friendly ? 1800 : 1400;
-    bp.Q.value = 0.7;
-    const ng = envGain(vol*0.9, 0.001, 0.09, t);
-    noise.connect(bp); bp.connect(ng); ng.connect(out);
-    noise.start(t); noise.stop(t+0.2);
-
-    // thump — low sine body
-    const osc = actx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(120, t);
-    osc.frequency.exponentialRampToValueAtTime(45, t+0.12);
-    const og = envGain(vol*0.8, 0.001, 0.14, t);
-    osc.connect(og); og.connect(out);
-    osc.start(t); osc.stop(t+0.16);
-
-    // tiny high tail for "snap"
-    const noise2 = makeNoise(0.05);
-    const hp = actx.createBiquadFilter();
-    hp.type = 'highpass'; hp.frequency.value = 4000;
-    const ng2 = envGain(vol*0.4, 0.001, 0.04, t);
-    noise2.connect(hp); hp.connect(ng2); ng2.connect(out);
-    noise2.start(t); noise2.stop(t+0.06);
+    playFile(GUNSHOT_FILE, vol, pan);
   }
 
   // Footstep: a very short, soft percussive tap. Tone depends on surface —
   // grass gets a duller thump with a bit of rustle blended in, wood gets a
   // tighter, higher, hollow knock. Pitch/tone wobbles a little per-step so
   // a run of footsteps doesn't sound like a machine.
-  function playFootstep(x, y, maxDist, forcedVol, indoors){
-    if(!actx || audioMuted) return;
+  function playFootstep(x, y, maxDist, forcedVol, surface){
     const {vol, pan} = forcedVol!==undefined ? {vol:forcedVol, pan:0} : spatial(x, y, maxDist);
     if(vol<=0.02) return;
-    const t = actx.currentTime;
-    const panner = actx.createStereoPanner ? actx.createStereoPanner() : null;
-    const out = panner || masterGain;
-    if(panner){ panner.pan.value = pan; panner.connect(masterGain); }
-
-    if(indoors){
-      // wood floor — tighter, higher, hollow knock
-      const noise = makeNoise(0.07);
-      const bp = actx.createBiquadFilter();
-      bp.type = 'bandpass';
-      bp.frequency.value = 650 + Math.random()*250;
-      bp.Q.value = 2.2;
-      const g = envGain(vol*0.32, 0.001, 0.045, t);
-      noise.connect(bp); bp.connect(g); g.connect(out);
-      noise.start(t); noise.stop(t+0.08);
-
-      const osc = actx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(180+Math.random()*40, t);
-      osc.frequency.exponentialRampToValueAtTime(90, t+0.05);
-      const og = envGain(vol*0.22, 0.001, 0.05, t);
-      osc.connect(og); og.connect(out);
-      osc.start(t); osc.stop(t+0.06);
-    } else {
-      // grass — duller low thump plus a soft rustle of blades
-      const thump = makeNoise(0.1);
-      const lp = actx.createBiquadFilter();
-      lp.type = 'lowpass';
-      lp.frequency.value = 220 + Math.random()*100;
-      const tg = envGain(vol*0.34, 0.003, 0.075, t);
-      thump.connect(lp); lp.connect(tg); tg.connect(out);
-      thump.start(t); thump.stop(t+0.11);
-
-      const rustle = makeNoise(0.09);
-      const bp2 = actx.createBiquadFilter();
-      bp2.type = 'bandpass';
-      bp2.frequency.value = 1100 + Math.random()*700;
-      bp2.Q.value = 0.9;
-      const rg = envGain(vol*0.14, 0.004, 0.07, t+0.01);
-      rustle.connect(bp2); bp2.connect(rg); rg.connect(out);
-      rustle.start(t+0.01); rustle.stop(t+0.1);
-    }
+    const file = FOOTSTEP_FILES[surface] || FOOTSTEP_FILES.grass;
+    playFile(file, vol*0.55, pan);
   }
 
   // Glass breaking: a bright noise burst plus a scatter of short, high,
@@ -4034,7 +4027,7 @@
       // taps out faster steps than a slowed aim-strafe
       player.footstepTimer -= dt;
       if(player.footstepTimer<=0){
-        playFootstep(player.x, player.y, 1, 0.5, isIndoors(player.x, player.y));
+        playFootstep(player.x, player.y, 1, 0.5, surfaceAt(player.x, player.y));
         player.footstepTimer = 0.32 / Math.max(0.35, speedMul*Math.min(mlen,1));
       }
     } else {
