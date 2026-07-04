@@ -259,6 +259,14 @@
   <button id="fpsToggleBtn" type="button" aria-pressed="false">
     <span class="dot"></span><span id="fpsToggleLabel">View: Top-Down</span>
   </button>
+  <label style="display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--amber);">
+    Music
+    <input type="range" id="musicVolumeSlider" min="0" max="100" value="40" title="Music volume" style="accent-color:var(--amber); vertical-align:middle;">
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--amber);">
+    Sound
+    <input type="range" id="sfxVolumeSlider" min="0" max="100" value="100" title="Sound effects volume" style="accent-color:var(--amber); vertical-align:middle;">
+  </label>
 </div>
 
 <div id="gameWrap">
@@ -3177,11 +3185,11 @@
     return el;
   }
   function playFile(src, vol, pan){
-    if(audioMuted) return;
+    if(audioMuted || sfxVolume<=0) return;
     const el = getPooledAudio(src);
     try{
       el.currentTime = 0;
-      el.volume = Math.max(0, Math.min(1, vol));
+      el.volume = Math.max(0, Math.min(1, vol*sfxVolume));
       // Stereo pan on plain <audio> elements needs a Web Audio pan node,
       // which requires the shared AudioContext to exist and each element to
       // be routed through it exactly once — cache that per-element the
@@ -3208,12 +3216,34 @@
   // sound carries" stays consistent between what you see and what you
   // hear), and left/right offset from the player controls stereo pan.
   let actx = null, masterGain = null, noiseBuffer = null;
+  const MUSIC_BASE_VOL = 0.4; // music.volume at 100% on the slider
+  const SFX_BASE_GAIN = 0.6;  // masterGain at 100% on the slider (legacy synthesized sounds)
+  const MUSIC_VOL_STORAGE_KEY = 'perimeter_musicVolume';
+  const SFX_VOL_STORAGE_KEY = 'perimeter_sfxVolume';
+  let musicVolume = 0.4; // 0-1, slider default 40
+  let sfxVolume = 1;     // 0-1, slider default 100
+  try{
+    const savedMusic = localStorage.getItem(MUSIC_VOL_STORAGE_KEY);
+    const savedSfx = localStorage.getItem(SFX_VOL_STORAGE_KEY);
+    if(savedMusic !== null) musicVolume = Math.max(0, Math.min(1, parseFloat(savedMusic)));
+    if(savedSfx !== null) sfxVolume = Math.max(0, Math.min(1, parseFloat(savedSfx)));
+  }catch(e){ /* localStorage unavailable — keep defaults above */ }
+  function setMusicVolume(v){
+    musicVolume = Math.max(0, Math.min(1, v));
+    music.volume = MUSIC_BASE_VOL * musicVolume;
+    try{ localStorage.setItem(MUSIC_VOL_STORAGE_KEY, String(musicVolume)); }catch(e){}
+  }
+  function setSfxVolume(v){
+    sfxVolume = Math.max(0, Math.min(1, v));
+    if(masterGain) masterGain.gain.value = SFX_BASE_GAIN * sfxVolume;
+    try{ localStorage.setItem(SFX_VOL_STORAGE_KEY, String(sfxVolume)); }catch(e){}
+  }
   function initAudio(){
     if(actx) return;
     try{
       actx = new (window.AudioContext || window.webkitAudioContext)();
       masterGain = actx.createGain();
-      masterGain.gain.value = 0.6;
+      masterGain.gain.value = SFX_BASE_GAIN * sfxVolume;
       masterGain.connect(actx.destination);
       // 1 second of white noise, reused (pitched/filtered differently) as the
       // raw material for gunshots, footsteps, glass, and impacts — cheaper
@@ -3240,8 +3270,19 @@
   // same first keypress/click/tap that already unlocks the sound effects.
   const music = new Audio('songs/OST1.mp3');
   music.loop = true;
-  music.volume = 0.4;
+  music.volume = MUSIC_BASE_VOL * musicVolume;
   let musicStarted = false;
+
+  const musicVolumeSlider = document.getElementById('musicVolumeSlider');
+  if(musicVolumeSlider){
+    musicVolumeSlider.value = String(Math.round(musicVolume*100));
+    musicVolumeSlider.addEventListener('input', ()=>{ setMusicVolume(musicVolumeSlider.value/100); });
+  }
+  const sfxVolumeSlider = document.getElementById('sfxVolumeSlider');
+  if(sfxVolumeSlider){
+    sfxVolumeSlider.value = String(Math.round(sfxVolume*100));
+    sfxVolumeSlider.addEventListener('input', ()=>{ setSfxVolume(sfxVolumeSlider.value/100); });
+  }
   function startMusic(){
     if(musicStarted || audioMuted) return;
     music.play().then(()=>{ musicStarted = true; }).catch(()=>{
