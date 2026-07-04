@@ -28,20 +28,14 @@
     }
   }
 
-  // ---- RPG Maker MZ-style A4 wall autotile ----
-  // Config: adjust these if your tileA4_walls.png uses a different path or
-  // if the wall "kind" you want isn't the first one in the sheet.
-  const WALL_CONFIG = { path: 'textures/tileA4_walls.png', kindCol: 0, tilePx: 16 };
+  // ---- Indoor wall material picker ----
+  // This sheet is NOT an RPG Maker quarter-composited autotile matrix — each
+  // 2(col) x 3(row) tile block is one wall material: row0 = decorative top
+  // strip (unused here, we never render wall tops), row1+2 = body/window
+  // face art. The 2 columns are just a left/right variant of that material.
+  // Config: adjust path/kindRow/kindCol to point at the material you want.
+  const WALL_CONFIG = { path: 'textures/tileA4_walls.png', kindRow: 0, kindCol: 0, tilePx: 16 };
   window.NesShooter3D_wallConfig = WALL_CONFIG; // tweak from devtools/console if needed
-
-  // 16 shapes (bit0=N,bit1=E,bit2=S,bit3=W solid), each a set of 4 quarter-tile
-  // [col,row] coords (in 24px quarter-tile units) to composite TL,TR,BL,BR.
-  const WALL_AUTOTILE_TABLE = [
-    [[2,2],[1,2],[2,1],[1,1]], [[0,2],[1,2],[0,1],[1,1]], [[2,0],[1,0],[2,1],[1,1]], [[0,0],[1,0],[0,1],[1,1]],
-    [[2,2],[3,2],[2,1],[3,1]], [[0,2],[3,2],[0,1],[3,1]], [[2,0],[3,0],[2,1],[3,1]], [[0,0],[3,0],[0,1],[3,1]],
-    [[2,2],[1,2],[2,3],[1,3]], [[0,2],[1,2],[0,3],[1,3]], [[2,0],[1,0],[2,3],[1,3]], [[0,0],[1,0],[0,3],[1,3]],
-    [[2,2],[3,2],[2,3],[3,3]], [[0,2],[3,2],[0,3],[3,3]], [[2,0],[3,0],[2,3],[3,3]], [[0,0],[3,0],[0,3],[3,3]]
-  ];
 
   let wallSheet = null, wallSheetReady = false;
   (function loadWallSheet(){
@@ -51,27 +45,21 @@
   })();
 
   const wallTexCache = {};
-  function shapeIndex(nSolid,eSolid,sSolid,wSolid){
-    return (nSolid?1:0)|(eSolid?2:0)|(sSolid?4:0)|(wSolid?8:0);
-  }
-  // Builds (and caches) a 48x48 canvas for one of the 16 connectivity shapes
-  // by pasting 4 quarter-tiles from the A4 sheet's "walktop" sub-block.
-  function getWallTex(shape){
+  // Returns a tilePx x (2*tilePx) canvas: the body+window rows of the chosen
+  // material, alternating the left/right column variant by tile position so
+  // adjacent wall segments don't look like an identical repeating stamp.
+  function getWallTex(r,c){
     if(!wallSheetReady) return TEX['#'];
-    const key = WALL_CONFIG.kindCol+'_'+shape;
+    const variant = (r+c)&1;
+    const key = WALL_CONFIG.kindRow+'_'+WALL_CONFIG.kindCol+'_'+variant;
     if(wallTexCache[key]) return wallTexCache[key];
-    const q = WALL_CONFIG.tilePx/2; // 24px quarter at default 48px tile
-    const originX = WALL_CONFIG.kindCol*4*q; // kind block is 2 tiles (4 quarters) wide
-    const c = document.createElement('canvas'); c.width=q*2; c.height=q*2;
-    const g = c.getContext('2d');
-    const corners = WALL_AUTOTILE_TABLE[shape];
-    const dst = [[0,0],[q,0],[0,q],[q,q]];
-    for(let i=0;i<4;i++){
-      const [qx,qy] = corners[i], [dx,dy] = dst[i];
-      g.drawImage(wallSheet, originX+qx*q, qy*q, q,q, dx,dy, q,q);
-    }
-    wallTexCache[key] = c;
-    return c;
+    const t = WALL_CONFIG.tilePx;
+    const sx = (WALL_CONFIG.kindCol*2 + variant) * t;
+    const sy = (WALL_CONFIG.kindRow*3 + 1) * t; // skip row0 (decorative top)
+    const canvas = document.createElement('canvas'); canvas.width=t; canvas.height=t*2;
+    canvas.getContext('2d').drawImage(wallSheet, sx, sy, t, t*2, 0, 0, t, t*2);
+    wallTexCache[key] = canvas;
+    return canvas;
   }
 
   function init(deps){
@@ -142,10 +130,7 @@
           const x0=c*TILE, y0=r*TILE, x1=x0+TILE, y1=y0+TILE, cx=(x0+x1)/2, cy=(y0+y1)/2;
           if(solid(ch)){
             let tx = TEX[ch];
-            if(ch==='#'){
-              const shape = shapeIndex(solid(neigh(r-1,c)), solid(neigh(r,c+1)), solid(neigh(r+1,c)), solid(neigh(r,c-1)));
-              tx = getWallTex(shape);
-            }
+            if(ch==='#') tx = getWallTex(r,c);
             if(!solid(neigh(r-1,c))) quads.push({p:[[x0,y0,0],[x1,y0,0],[x1,y0,WALL_H],[x0,y0,WALL_H]], tex:tx, cx, cy:y0});
             if(!solid(neigh(r+1,c))) quads.push({p:[[x1,y1,0],[x0,y1,0],[x0,y1,WALL_H],[x1,y1,WALL_H]], tex:tx, cx, cy:y1});
             if(!solid(neigh(r,c-1))) quads.push({p:[[x0,y1,0],[x0,y0,0],[x0,y0,WALL_H],[x0,y1,WALL_H]], tex:tx, cx:x0, cy});
