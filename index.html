@@ -1144,6 +1144,7 @@
   const sandRects = [];    // walkable, but slows the player — beach ring just inside the ocean
   const treeRects = [];    // blocks movement AND bullets AND sight, same as a wall — forest trunks
   const windowRects = [];  // blocks movement only, and only until broken — never blocks sight or bullets
+  const doorRects = [];    // house entrance/exit tiles — walkable and always open (see enterHouse/exitHouse), drawn as a dedicated door slab sitting in the wall opening rather than a plain gap
   const floorTiles = [];   // for random spawn picking
   const houseFloorTiles = []; // floor tiles inside a house footprint only — all spawns/respawns are picked from this list
   const interiorRects = []; // floor tiles inside a house footprint — drawn as wood flooring, not grass
@@ -1199,7 +1200,7 @@
   // needs to know the stage even exists.
   function rebuildCollisionCaches(){
     wallRects.length = 0; waterRects.length = 0; sandRects.length = 0; treeRects.length = 0;
-    windowRects.length = 0; floorTiles.length = 0; houseFloorTiles.length = 0; interiorRects.length = 0;
+    windowRects.length = 0; doorRects.length = 0; floorTiles.length = 0; houseFloorTiles.length = 0; interiorRects.length = 0;
     windowGrid.clear();
     for(let row=0; row<ROWS; row++){
       for(let col=0; col<COLS; col++){
@@ -1222,6 +1223,13 @@
           windowRects.push(w);
           windowGrid.set(row*COLS+col, w);
           // deliberately NOT added to floorTiles — don't spawn things in a windowpane
+        } else if(ch === 'D'){
+          doorRects.push({x:px, y:py, w:TILE, h:TILE});
+          floorTiles.push({x:px+TILE/2, y:py+TILE/2});
+          if(insideAHouse(col,row)){
+            interiorRects.push({x:px, y:py, w:TILE, h:TILE});
+            houseFloorTiles.push({x:px+TILE/2, y:py+TILE/2});
+          }
         } else {
           floorTiles.push({x:px+TILE/2, y:py+TILE/2});
           if(insideAHouse(col,row)){
@@ -3094,13 +3102,15 @@
 
   function spawnEnemy(at){
     const pos = at || pickHouseSpawn(player, SPAWN_SAFE_DIST);
+    const wanderAngle = Math.random()*Math.PI*2;
     return {
       x: pos.x, y: pos.y,
       r: CHAR_FOOT_R, hp: 40, maxHp: 40,
       speed: 36, // r and speed scaled down along with TILE, see note above
       alive: true,
-      wanderAngle: Math.random()*Math.PI*2,
-      wanderTimer: 0,
+      wanderAngle, wanderTimer: 0,
+      facing: wanderAngle, // which way they're currently looking — see ENEMY_VIEW_ARC_HALF below, can't detect the player behind them
+      aware: false,        // once they've spotted the player through the facing cone, LOS alone keeps them locked on — losing LOS resets this, requiring the cone check again to re-spot
       shotCd: 0,
       soundTimer: 0,    // footstep-sound cooldown, only ticks a pulse while hidden from the player
       weaponDef: pickWeaponDef(), // rolled from the same loot table as crates — fires with its real stats, and drops it on death (see dropEnemyWeapon)
@@ -3212,14 +3222,16 @@
   }
   function spawnZombie(at){
     const pos = at || pickForestSpawn();
+    const wanderAngle = Math.random()*Math.PI*2;
     return {
       x: pos.x, y: pos.y,
       r: CHAR_FOOT_R, hp: 30, maxHp: 30,
       speed: 30, // r and speed scaled down along with TILE, see note above
       alive: true,
       type: 'zombie',
-      wanderAngle: Math.random()*Math.PI*2,
-      wanderTimer: 0,
+      wanderAngle, wanderTimer: 0,
+      facing: wanderAngle, // see ENEMY_VIEW_ARC_HALF below — can't detect the player directly behind them
+      aware: false,
       meleeCd: 0,
       soundTimer: 0,
       weaponDef: null, // no gun — never drops anything on death
@@ -3227,6 +3239,21 @@
       moving: false,
       facingRight: true
     };
+  }
+
+  // Enemies get the same treatment as the player's own vision (see
+  // playerCanSee/VIEW_ARC_HALF above) — a forward-facing cone, not
+  // omnidirectional awareness, and this applies unconditionally, not just
+  // when the player has the fog-of-war overlay switched on for their own
+  // screen (that toggle only affects what gets rendered/dimmed for the
+  // player; it was never meant to change what enemies are capable of
+  // noticing). An unobstructed, in-range player standing directly behind an
+  // enemy should NOT get spotted — only once the player is generally in
+  // front of them, or they're already alerted and tracking (see `aware` on
+  // each enemy, set below), does a clear line of sight count as "seen."
+  const ENEMY_VIEW_ARC_HALF = Math.PI * (105/180); // 210° FOV, same as the player
+  function inFacingCone(facing, toAngle){
+    return Math.abs(angleDiff(toAngle, facing)) <= ENEMY_VIEW_ARC_HALF;
   }
 
   // Kill-and-respawn, branched by enemy type: gunmen drop their weapon and
@@ -4582,9 +4609,17 @@
         // Unarmed: just closes the distance once it sees you, then swings a
         // knife-arc melee attack in range instead of a flat contact tick —
         // no gun, so line-of-sight is the only gate (no shooting range cap).
-        const hasLOS = distToPlayer < ZOMBIE_DETECT_RANGE && canSee(e.x, e.y, player.x, player.y, ZOMBIE_DETECT_RANGE);
+        // Detecting the player at ALL still requires them to be in the
+        // facing cone though (see ENEMY_VIEW_ARC_HALF) — once already
+        // aware, plain LOS is enough to keep tracking even if the player
+        // circles behind them afterward.
+        const toPlayerAngle = Math.atan2(player.y-e.y, player.x-e.x);
+        const rawLOS = distToPlayer < ZOMBIE_DETECT_RANGE && canSee(e.x, e.y, player.x, player.y, ZOMBIE_DETECT_RANGE);
+        const hasLOS = rawLOS && (e.aware || inFacingCone(e.facing, toPlayerAngle));
+        e.aware = hasLOS;
         if(hasLOS){
-          const a = Math.atan2(player.y-e.y, player.x-e.x);
+          const a = toPlayerAngle;
+          e.facing = a;
           const contactDist = e.r + player.r + 4;
           e.moving = distToPlayer > contactDist;
           if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
@@ -4616,6 +4651,7 @@
             e.wanderTimer = 1.5+Math.random()*1.5;
           }
           e.moving = true;
+          e.facing = e.wanderAngle;
           if(Math.abs(Math.cos(e.wanderAngle)) > 0.01) e.facingRight = Math.cos(e.wanderAngle) >= 0;
           e.x += Math.cos(e.wanderAngle)*e.speed*0.4*dt;
           e.y += Math.sin(e.wanderAngle)*e.speed*0.4*dt;
@@ -4629,9 +4665,17 @@
         // be well within 320px of the player in world-space (sectors are
         // screen-sized, not huge) despite being nowhere the player can see
         // or shoot back at. Without this they snipe you from off-screen.
-        const enemyHasLOS = isOnScreen(e.x, e.y, e.r) && distToPlayer < 320 && canSee(e.x, e.y, player.x, player.y, 320);
+        // And, same as zombies above, first detection also requires the
+        // player to be somewhere in front of them — no eyes in the back of
+        // the head — though once already aware they keep tracking on LOS
+        // alone even if you circle around behind them afterward.
+        const toPlayerAngle = Math.atan2(player.y-e.y, player.x-e.x);
+        const rawLOS = isOnScreen(e.x, e.y, e.r) && distToPlayer < 320 && canSee(e.x, e.y, player.x, player.y, 320);
+        const enemyHasLOS = rawLOS && (e.aware || inFacingCone(e.facing, toPlayerAngle));
+        e.aware = enemyHasLOS;
         if(enemyHasLOS){
-          const a = Math.atan2(player.y-e.y, player.x-e.x);
+          const a = toPlayerAngle;
+          e.facing = a;
           e.moving = true;
           if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
           e.x += Math.cos(a)*e.speed*dt;
@@ -4663,6 +4707,7 @@
             e.wanderTimer = 1.5+Math.random()*1.5;
           }
           e.moving = true;
+          e.facing = e.wanderAngle;
           if(Math.abs(Math.cos(e.wanderAngle)) > 0.01) e.facingRight = Math.cos(e.wanderAngle) >= 0;
           e.x += Math.cos(e.wanderAngle)*e.speed*0.4*dt;
           e.y += Math.sin(e.wanderAngle)*e.speed*0.4*dt;
@@ -4861,6 +4906,24 @@
           ctx.stroke();
         }
       }
+    }
+
+    // door tiles — the entrance/exit trigger for a house (see enterHouse/
+    // exitHouse). Always walkable, never blocks sight or bullets, same as a
+    // window — but drawn as a solid door slab sitting in the wall opening
+    // rather than reading as just a gap, so it's obviously a door from a
+    // distance. Square, not round, to match every other tile here.
+    for(const o of doorRects){
+      if(!onScreen(o)) continue;
+      ctx.fillStyle = NES.red;
+      ctx.fillRect(o.x+2, o.y+2, o.w-4, o.h-4);
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(o.x+2, o.y+2, o.w-4, 3);
+      ctx.fillStyle = NES.brownDark;
+      ctx.fillRect(o.x, o.y, o.w, 2);
+      ctx.fillRect(o.x, o.y+o.h-2, o.w, 2);
+      ctx.fillRect(o.x, o.y, 2, o.h);
+      ctx.fillRect(o.x+o.w-2, o.y, 2, o.h);
     }
   }
 
@@ -5110,7 +5173,7 @@
         glyphs.push({img, w, h});
         totalW += w*DIGIT_KERN;
       }
-      totalW += glyphs.length ? glyphs[glyphs.length-1].w*(1-DIGIT_KERN) : 0; // last glyph's full width, not just its advance
+      totalW += (glyphs.length && glyphs[glyphs.length-1]) ? glyphs[glyphs.length-1].w*(1-DIGIT_KERN) : 0; // last glyph's full width, not just its advance — guarded since a not-yet-loaded texture leaves a null entry
       let dx = n.x - totalW/2;
       ctx.save();
       ctx.globalAlpha = alpha;
