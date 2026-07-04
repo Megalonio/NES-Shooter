@@ -1398,7 +1398,14 @@
     zombie: 'textures/zombie.png',
     // ground-drop pickup icons all come from one sprite sheet now (see
     // WEAPON_SPRITE_MAP below for which column each weapon id uses).
-    weaponSheet: 'textures/weapons.png'
+    weaponSheet: 'textures/weapons.png',
+    // Floating hit-number digits — one image per value 0-10, used to spell
+    // out damage numbers digit-by-digit (e.g. "34" draws the '3' and '4'
+    // images side by side). The single 10.png is only used when a hit's
+    // rounded damage is exactly 10, same as any other digit image.
+    ui: {
+      numbers: Array.from({length:11}, (_,i)=>`ui/${i}.png`)
+    }
   };
 
   // ---- weapons.png sprite sheet layout ----
@@ -1914,6 +1921,7 @@
   loadTex('player',       TEXTURES.player);
   loadTex('zombie',       TEXTURES.zombie);
   loadTex('weaponSheet', TEXTURES.weaponSheet);
+  TEXTURES.ui.numbers.forEach((url,i)=> loadTex('ui.number'+i, url));
 
   // ---------------- Character animation: idle/walk only ----------------
   // Survivors (the player) are drawn as a random pick from every non-orc
@@ -3102,6 +3110,7 @@
   const impacts = []; // {x,y,age,life,kind,angle} — brief spark/shard/dust burst where a bullet actually hits something
   const swingEffects = []; // {x,y,angle,arc,range,timer,maxTimer} — melee sweep visuals
   const soundPulses = []; // {x,y,age,duration,startR,maxR,maxDist} — a footstep sound event; see drawSoundPulses for how it actually reaches the player
+  const hitNumbers = []; // {x,y,vy,age,life,text} — floating damage number where a hit landed
 
   // Sound travels at a real, finite speed (343 m/s), and how far it carries
   // before it's too quiet to hear at all depends on how loud it was. At
@@ -3786,6 +3795,22 @@
   // A brief burst of particles at the point a bullet actually strikes
   // something solid — separate from the tracer, this is what sells "that
   // shot just hit a wall" rather than the round simply vanishing.
+  // A floating damage number that pops up where a hit landed and drifts
+  // upward while fading — classic action-RPG "hit number" feedback.
+  // Amount is rounded to a whole number and spelled out digit-by-digit
+  // using the ui/#.png glyphs (see TEXTURES.ui.numbers).
+  function spawnHitNumber(x, y, amount){
+    const rounded = Math.max(0, Math.round(amount));
+    hitNumbers.push({
+      x: x + (Math.random()*8-4), // slight horizontal jitter so stacked hits don't perfectly overlap
+      y: y - TILE*0.3,
+      vy: -TILE*1.1,
+      age: 0,
+      life: 0.7,
+      text: String(rounded)
+    });
+  }
+
   function spawnImpact(x, y, kind){
     const n = kind==='glass' ? 7 : 5;
     for(let i=0;i<n;i++){
@@ -3854,6 +3879,7 @@
         const a = Math.atan2(e.y-player.y, e.x-player.x);
         if(Math.abs(angleDiff(a, angle)) <= mw.arc/2){
           e.hp -= mw.damage;
+          spawnHitNumber(e.x, e.y - e.r, mw.damage);
           // small knockback along the swing direction
           e.x += Math.cos(angle)*10;
           e.y += Math.sin(angle)*10;
@@ -4253,6 +4279,7 @@
             if(!e.alive) continue;
             if(Math.hypot(b.x-e.x, b.y-e.y) < e.r){
               e.hp -= liveDmg;
+              spawnHitNumber(e.x, e.y - e.r, liveDmg);
               dead = true;
               spawnImpact(b.x, b.y, 'flesh');
               if(e.hp<=0){
@@ -4318,6 +4345,13 @@
     for(let i=impacts.length-1;i>=0;i--){
       impacts[i].age += dt;
       if(impacts[i].age > impacts[i].life) impacts.splice(i,1);
+    }
+    for(let i=hitNumbers.length-1;i>=0;i--){
+      const n = hitNumbers[i];
+      n.age += dt;
+      n.y += n.vy*dt;
+      n.vy *= 0.90; // quick decelerating rise, same feel as most action-RPG hit numbers
+      if(n.age > n.life) hitNumbers.splice(i,1);
     }
 
     // ---- enemy AI ----
@@ -4828,6 +4862,42 @@
     }
   }
 
+  // Floating damage numbers: each digit is drawn from its own ui/#.png
+  // glyph, laid out side by side and centered above the hit point. Falls
+  // back to nothing (silently skipped) for any digit whose image hasn't
+  // loaded yet, same "degrade gracefully" pattern as every other texture
+  // slot in this file.
+  const HIT_NUMBER_GLYPH_H = 7; // rendered glyph height in world px — small, NES-tile scale
+  function drawHitNumbers(){
+    for(const n of hitNumbers){
+      const frac = 1 - n.age/n.life;
+      const alpha = Math.min(1, frac*1.4); // holds near-full opacity, then fades fast at the very end
+      const scale = 0.8 + Math.min(1, n.age/0.12)*0.2; // tiny pop-in grow over the first ~0.12s
+
+      // measure total width first so the whole string can be centered
+      const glyphs = [];
+      let totalW = 0;
+      for(const ch of n.text){
+        const img = getTex('ui.number'+ch);
+        if(!img){ glyphs.push(null); continue; }
+        const h = HIT_NUMBER_GLYPH_H*scale;
+        const w = h * (img.width/img.height);
+        glyphs.push({img, w, h});
+        totalW += w;
+      }
+      let dx = n.x - totalW/2;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      for(const g of glyphs){
+        if(g) ctx.drawImage(g.img, dx, n.y - g.h/2, g.w, g.h);
+        else dx += HIT_NUMBER_GLYPH_H*0.6; // missing glyph — leave a placeholder gap instead of crushing the rest together
+        if(g) dx += g.w;
+      }
+      ctx.restore();
+    }
+  }
+
+
   function drawFog(){
     if(!fogOfWarEnabled) return;
     // Only sweep the tiles actually on screen — same idea as drawTiles()'s
@@ -4981,6 +5051,7 @@
     }
     drawFog();
     drawSoundPulses();
+    drawHitNumbers();
 
     drawCharacter(player.x, player.y, player.r, player.angle, '#4fd1c5', '#123330', getTex('player'), getAnimFrame('survivor', player.survivor, player.anim), player.facingRight);
 
