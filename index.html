@@ -611,6 +611,11 @@
     if(!crtCanvas) return;
     gl = crtCanvas.getContext('webgl') || crtCanvas.getContext('experimental-webgl');
     if(!gl) return; // no WebGL support — silently fall back to the plain 2D canvas
+    // Needed for fwidth() in the fragment shader, which we use to fade the
+    // LED subpixel split back to flat color wherever the pattern is too
+    // fine for the display to resolve (see u_ledSplit block below) — that
+    // fade is what keeps that effect from aliasing into moiré.
+    gl.getExtension('OES_standard_derivatives');
 
     const vsSrc = `
       attribute vec2 a_pos;
@@ -621,6 +626,7 @@
       }
     `;
     const fsSrc = `
+      #extension GL_OES_standard_derivatives : enable
       precision mediump float;
       varying vec2 v_uv;
       uniform sampler2D u_tex;
@@ -665,10 +671,30 @@
           // only its own channel (dimmed to that channel's real value,
           // scanlines and all), the other two go dark, same as a real
           // sub-pixel would.
-          float subCell = mod(floor(uv.x * u_srcRes.x * 3.0), 3.0);
-          if(subCell < 1.0) color = vec3(color.r, 0.0, 0.0);
-          else if(subCell < 2.0) color = vec3(0.0, color.g, 0.0);
-          else color = vec3(0.0, 0.0, color.b);
+          //
+          // IRL you don't see individual subpixels because your eye can't
+          // resolve them at viewing distance — they're below the eye's
+          // sampling rate, so they blend into flat color. A GLSL point
+          // sample has no such limit, so without correcting for it we're
+          // literally aliasing: the barrel warp changes the LOCAL frequency
+          // of this stripe pattern as it moves off-center (it's a radial
+          // warp), and once that frequency gets near the output's own pixel
+          // density you get exactly the colored-ring moiré artifact this
+          // was producing. fwidth(x) tells us how fast the stripe
+          // coordinate is changing per output pixel — i.e. whether the
+          // display can actually resolve individual stripes here. Where it
+          // can (screen center, low warp), we do the real per-channel
+          // split. Where it can't (edges, high warp), we fade back to the
+          // untouched combined color instead of point-sampling a signal the
+          // screen can't represent.
+          float x = uv.x * u_srcRes.x * 3.0;
+          float aa = fwidth(x);
+          float resolvable = clamp(1.0 - aa, 0.0, 1.0);
+          float subCell = mod(floor(x), 3.0);
+          vec3 split = (subCell < 1.0) ? vec3(color.r, 0.0, 0.0)
+                     : (subCell < 2.0) ? vec3(0.0, color.g, 0.0)
+                                        : vec3(0.0, 0.0, color.b);
+          color = mix(color, split, resolvable);
         } else {
           // Light per-output-pixel-column RGB phosphor triad.
           float col = mod(gl_FragCoord.x, 3.0);
