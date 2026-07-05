@@ -3411,6 +3411,67 @@
   let insideHouse = null;
   function worldToTile(px,py){ return {col: Math.floor(px/TILE), row: Math.floor(py/TILE)}; }
 
+  // ---- door transition: chunky pixel-dissolve wipe, Game Boy Pokémon
+  // battle-intro style, kept blocky/hard-edged so it reads as NES/SNES
+  // rather than a smooth modern fade ----
+  // Blocks are NATIVE_TILE-sized (the real 8px NES/SNES grid, not whatever
+  // TILE happens to be scaled to) so the wipe always lines up with the
+  // actual pixel grid no matter which tile-size/res toggle is active.
+  // Sequence: shuffle every block on screen into a random order, blacken
+  // them one-by-one until the screen's fully covered (closing), swap the
+  // map/teleport the player while hidden, then reveal them in that same
+  // order (opening) — the whole simulation freezes while this runs (see
+  // the doorTransition.active check in update()), same as the existing
+  // screen-scroll transition freeze right above it.
+  const DOOR_TRANSITION_DURATION = 0.32; // seconds per half (close, then open)
+  const doorTransition = { active:false, phase:null, t:0, blocks:null, action:null };
+
+  function buildDoorTransitionBlocks(){
+    const cols = Math.ceil(W/NATIVE_TILE), rows = Math.ceil(H/NATIVE_TILE);
+    const blocks = [];
+    for(let r=0; r<rows; r++) for(let c=0; c<cols; c++) blocks.push({x:c*NATIVE_TILE, y:r*NATIVE_TILE});
+    for(let i=blocks.length-1; i>0; i--){ // Fisher-Yates — fresh random dissolve order every time
+      const j = Math.floor(rng()*(i+1));
+      const tmp = blocks[i]; blocks[i] = blocks[j]; blocks[j] = tmp;
+    }
+    return blocks;
+  }
+
+  function startDoorTransition(action){
+    doorTransition.active = true;
+    doorTransition.phase = 'closing';
+    doorTransition.t = 0;
+    doorTransition.blocks = buildDoorTransitionBlocks();
+    doorTransition.action = action;
+  }
+
+  function updateDoorTransition(dt){
+    doorTransition.t += dt;
+    if(doorTransition.phase === 'closing'){
+      if(doorTransition.t >= DOOR_TRANSITION_DURATION){
+        doorTransition.action(); // screen is fully black now — safe to swap the map/teleport
+        doorTransition.phase = 'opening';
+        doorTransition.t = 0;
+      }
+    } else if(doorTransition.t >= DOOR_TRANSITION_DURATION){
+      doorTransition.active = false;
+    }
+  }
+
+  // Drawn from loop() right after render(), so it's still native-res
+  // (pre-CRT/LED post-process) — the blocks stay crisp, hard-edged squares
+  // no matter what the CRT curvature/scanlines do to them afterward.
+  function drawDoorTransition(){
+    const frac = Math.min(1, doorTransition.t / DOOR_TRANSITION_DURATION);
+    const blackedFrac = doorTransition.phase === 'closing' ? frac : (1-frac);
+    const count = Math.floor(blackedFrac * doorTransition.blocks.length);
+    ctx.fillStyle = '#000';
+    for(let i=0; i<count; i++){
+      const b = doorTransition.blocks[i];
+      ctx.fillRect(b.x, b.y, NATIVE_TILE, NATIVE_TILE);
+    }
+  }
+
   function enterHouse(house){
     if(insideHouse) return; // already inside somewhere — shouldn't happen, but don't stack transitions
     if(!house.interior) house.interior = buildHouseInterior(house);
@@ -4807,6 +4868,8 @@
     if(fpsMode && addon3D) addon3D.render();
     else render();
 
+    if(doorTransition.active) drawDoorTransition();
+
     const crtActive = crtEnabled && crtReady;
     if(crtActive) drawCRTFrame();
     // Flat fallback only — when CRT is active it already bakes the LED
@@ -4828,6 +4891,14 @@
     // (NESScroll freezes Game_Player + Game_Event entirely while locked).
     if(screenScroller.locked){
       scrollerUpdateTransition();
+      return;
+    }
+
+    // ---- door transition freeze ----
+    // Same idea, for entering/exiting a house — see startDoorTransition()
+    // for the actual effect.
+    if(doorTransition.active){
+      updateDoorTransition(dt);
       return;
     }
 
@@ -4933,9 +5004,9 @@
       const t = worldToTile(player.x, player.y);
       if(!insideHouse){
         const h = HOUSE_DOOR_LOOKUP.get(t.row+','+t.col);
-        if(h) enterHouse(h);
+        if(h) startDoorTransition(() => enterHouse(h));
       } else if(t.row-INTERIOR_ROW0 === insideHouse.interior.doorLocalRow && t.col === insideHouse.interior.doorLocalCol){
-        exitHouse();
+        startDoorTransition(() => exitHouse());
       }
     }
 
@@ -5522,16 +5593,29 @@
     // (+1 reload in the bank) instead of doing nothing. Manual interact
     // (F / PICK UP) is still how you swap out a weapon when neither of
     // those applies (both slots full, no ammo match — a deliberate choice).
-    nearestPickup = findNearestPickup();
-    if(nearestPickup){
-      const drop = nearestPickup;
-      if(hasFreeSlotFor(drop.def)){
-        pickUpWeapon(drop);
-        const i = droppedWeapons.indexOf(drop);
-        if(i>=0) droppedWeapons.splice(i,1);
-        nearestPickup = null;
-      } else {
-        const ammoType = drop.def.ammoType;
+    //
+    // The ammo-merge case is deliberately deferred until the player LEAVES
+    // the drop's hitbox, not the instant they enter it. Both slots full
+    // means the player might be walking over this specifically to interact
+    // and swap it in for whatever they're holding — auto-siphoning its
+    // ammo the moment they step on it would take that choice away before
+    // they even get a chance to press the pickup button. Waiting until they
+    // walk back off it (having NOT interacted) means "leave without
+    // swapping" is what signals "just take the ammo instead", same as it
+    // would in a game with a real pickup prompt.
+    for(let i=droppedWeapons.length-1; i>=0; i--){
+      const d = droppedWeapons[i];
+      const inRange = Math.hypot(player.x-d.x, player.y-d.y) < player.r + WEAPON_PICKUP_R;
+      if(inRange){
+        if(hasFreeSlotFor(d.def)){
+          pickUpWeapon(d);
+          droppedWeapons.splice(i,1);
+        } else {
+          d._playerWasInRange = true; // both slots full — remember, don't merge ammo yet
+        }
+      } else if(d._playerWasInRange){
+        d._playerWasInRange = false;
+        const ammoType = d.def.ammoType;
         let matched = false;
         if(ammoType){
           for(const w of [mainWeapon, sidearmWeapon]){
@@ -5541,13 +5625,10 @@
             }
           }
         }
-        if(matched){
-          const i = droppedWeapons.indexOf(drop);
-          if(i>=0) droppedWeapons.splice(i,1);
-          nearestPickup = null;
-        }
+        if(matched) droppedWeapons.splice(i,1);
       }
     }
+    nearestPickup = findNearestPickup();
 
     updateHealthPickups();
 
