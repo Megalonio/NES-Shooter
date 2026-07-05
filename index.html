@@ -868,23 +868,63 @@
     NES_PAL_B[i] = parseInt(hex.slice(5,7), 16);
   });
 
-  // Recolors the finished game canvas in place: for every pixel, finds the
-  // nearest NES palette entry by squared RGB distance and snaps to it.
+  // Recolors the finished game canvas in place, snapping every pixel to its
+  // nearest NES palette entry. We can't just bake the palette into the
+  // source textures once and skip this step — plenty of what lands on
+  // `ctx` every frame isn't a texture at all: muzzle-glow gradients,
+  // damage-flash overlays, particle fades, HUD alpha-blends, etc. are all
+  // drawn straight to the canvas with their own arbitrary RGBA colors, so
+  // only a full-frame pass catches those too. Baking the palette into
+  // textures alone would leave all of that unquantized.
+  //
+  // What *was* slow here was doing a brute-force "check all 55 palette
+  // entries" search per pixel (256x240 pixels x 55 candidates = ~3.4M
+  // distance checks every single frame, ~14M in hi-res mode). Instead we
+  // quantize the 24-bit RGB space down to 5 bits/channel (32,768 buckets)
+  // and solve the nearest-palette-entry search for every bucket ONCE, up
+  // front, at load. At runtime each pixel becomes a single lookup —
+  // O(pixels), not O(pixels x palette).
+  const NES_LUT_BITS = 5; // 5 bits/channel = 32 levels = 32768 total buckets
+  const NES_LUT_SHIFT = 8 - NES_LUT_BITS;
+  const NES_LUT_SIZE = 1 << (NES_LUT_BITS * 3);
+  const NES_LUT_R = new Uint8Array(NES_LUT_SIZE);
+  const NES_LUT_G = new Uint8Array(NES_LUT_SIZE);
+  const NES_LUT_B = new Uint8Array(NES_LUT_SIZE);
+  (function buildNesLut(){
+    const paletteLen = NES_PAL_R.length;
+    const levels = 1 << NES_LUT_BITS;
+    for(let ri = 0; ri < levels; ri++){
+      // sample at bucket center so quantization rounds rather than truncates
+      const r = Math.min(255, (ri << NES_LUT_SHIFT) + (1 << (NES_LUT_SHIFT-1)));
+      for(let gi = 0; gi < levels; gi++){
+        const g = Math.min(255, (gi << NES_LUT_SHIFT) + (1 << (NES_LUT_SHIFT-1)));
+        for(let bi = 0; bi < levels; bi++){
+          const b = Math.min(255, (bi << NES_LUT_SHIFT) + (1 << (NES_LUT_SHIFT-1)));
+          let bestDist = Infinity, bestIdx = 0;
+          for(let p = 0; p < paletteLen; p++){
+            const dr = r - NES_PAL_R[p], dg = g - NES_PAL_G[p], db = b - NES_PAL_B[p];
+            const dist = dr*dr + dg*dg + db*db;
+            if(dist < bestDist){ bestDist = dist; bestIdx = p; }
+          }
+          const idx = (ri << (NES_LUT_BITS*2)) | (gi << NES_LUT_BITS) | bi;
+          NES_LUT_R[idx] = NES_PAL_R[bestIdx];
+          NES_LUT_G[idx] = NES_PAL_G[bestIdx];
+          NES_LUT_B[idx] = NES_PAL_B[bestIdx];
+        }
+      }
+    }
+  })();
+
   function applyNesPalette(){
     const imgData = ctx.getImageData(0, 0, W, H);
     const data = imgData.data;
-    const paletteLen = NES_PAL_R.length;
     for(let i = 0; i < data.length; i += 4){
-      const r = data[i], g = data[i+1], b = data[i+2];
-      let bestDist = Infinity, bestIdx = 0;
-      for(let p = 0; p < paletteLen; p++){
-        const dr = r - NES_PAL_R[p], dg = g - NES_PAL_G[p], db = b - NES_PAL_B[p];
-        const dist = dr*dr + dg*dg + db*db;
-        if(dist < bestDist){ bestDist = dist; bestIdx = p; }
-      }
-      data[i] = NES_PAL_R[bestIdx];
-      data[i+1] = NES_PAL_G[bestIdx];
-      data[i+2] = NES_PAL_B[bestIdx];
+      const idx = ((data[i] >> NES_LUT_SHIFT) << (NES_LUT_BITS*2)) |
+                  ((data[i+1] >> NES_LUT_SHIFT) << NES_LUT_BITS) |
+                  (data[i+2] >> NES_LUT_SHIFT);
+      data[i] = NES_LUT_R[idx];
+      data[i+1] = NES_LUT_G[idx];
+      data[i+2] = NES_LUT_B[idx];
     }
     ctx.putImageData(imgData, 0, 0);
   }
