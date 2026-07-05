@@ -3369,7 +3369,7 @@
 
   const enemies = enemySpawns.map(pos => spawnEnemy(pos));
   const ZOMBIE_COUNT = Math.max(1, Math.round(FOREST_TREE_COUNT/5));
-  for(let i=0;i<ZOMBIE_COUNT;i++) enemies.push(spawnZombie());
+  // for(let i=0;i<ZOMBIE_COUNT;i++) enemies.push(spawnZombie()); // zombies disabled
 
   function spawnEnemy(at){
     const pos = at || pickHouseSpawn(player, SPAWN_SAFE_DIST);
@@ -3411,64 +3411,93 @@
   let insideHouse = null;
   function worldToTile(px,py){ return {col: Math.floor(px/TILE), row: Math.floor(py/TILE)}; }
 
-  // ---- door transition: chunky pixel-dissolve wipe, Game Boy Pokémon
-  // battle-intro style, kept blocky/hard-edged so it reads as NES/SNES
-  // rather than a smooth modern fade ----
+  // ---- door transition: 3 sequential "bangs" (BANG. BANG. BANG.), each
+  // one a ripple that expands outward from a random point on screen ----
   // Blocks are NATIVE_TILE-sized (the real 8px NES/SNES grid, not whatever
-  // TILE happens to be scaled to) so the wipe always lines up with the
-  // actual pixel grid no matter which tile-size/res toggle is active.
-  // Sequence: shuffle every block on screen into a random order, blacken
-  // them one-by-one until the screen's fully covered (closing), swap the
-  // map/teleport the player while hidden, then reveal them in that same
-  // order (opening) — the whole simulation freezes while this runs (see
-  // the doorTransition.active check in update()), same as the existing
-  // screen-scroll transition freeze right above it.
-  const DOOR_TRANSITION_DURATION = 0.32; // seconds per half (close, then open)
-  const doorTransition = { active:false, phase:null, t:0, blocks:null, action:null };
+  // TILE happens to be scaled to) so it always lines up with the actual
+  // pixel grid no matter which tile-size/res toggle is active.
+  //
+  // There's no fully-black moment at all: the map swap/teleport happens
+  // IMMEDIATELY, and render() draws that new state live every frame from
+  // then on. What you actually see is a snapshot of the OLD frame (taken
+  // the instant before the swap) painted back OVER the live new frame,
+  // block by block — except wherever a ripple's already swept past, which
+  // just shows the live new render straight through, and right at each
+  // ripple's leading edge, a black band of blocks (that's the "ripple
+  // turning the sprite black, then into the headed location" bit — black
+  // is the momentary seam between old and new as the wavefront crosses).
+  // Three staggered origins/start-times means three overlapping wavefronts
+  // eating into the old frame from different points, one after another,
+  // instead of one wipe from a single spot.
+  const DOOR_BANG_COUNT = 3;
+  const DOOR_BANG_STAGGER = 0.15;   // seconds between each BANG starting
+  const DOOR_RIPPLE_DURATION = 1.7; // seconds for one ripple to cross the whole screen after its own start — combined with the 2x0.15s stagger below, total transition is ~2s
+  const DOOR_BAND_WIDTH = NATIVE_TILE * 3; // thickness of the black seam at each wavefront
+  const doorTransition = { active:false, t:0, totalDuration:0, bangs:null, snapshot:null };
 
-  function buildDoorTransitionBlocks(){
+  // Full grid of native-pixel blocks, built once — reused by every
+  // transition (W/H don't change without a reload, see the res toggle).
+  let doorTransitionGrid = null;
+  function getDoorTransitionGrid(){
+    if(doorTransitionGrid) return doorTransitionGrid;
     const cols = Math.ceil(W/NATIVE_TILE), rows = Math.ceil(H/NATIVE_TILE);
     const blocks = [];
-    for(let r=0; r<rows; r++) for(let c=0; c<cols; c++) blocks.push({x:c*NATIVE_TILE, y:r*NATIVE_TILE});
-    for(let i=blocks.length-1; i>0; i--){ // Fisher-Yates — fresh random dissolve order every time
-      const j = Math.floor(rng()*(i+1));
-      const tmp = blocks[i]; blocks[i] = blocks[j]; blocks[j] = tmp;
+    for(let r=0; r<rows; r++){
+      for(let c=0; c<cols; c++){
+        const x = c*NATIVE_TILE, y = r*NATIVE_TILE;
+        blocks.push({x, y, cx:x+NATIVE_TILE/2, cy:y+NATIVE_TILE/2});
+      }
     }
+    doorTransitionGrid = blocks;
     return blocks;
   }
 
   function startDoorTransition(action){
+    // Grab exactly what's on screen right now, before anything changes.
+    const snap = document.createElement('canvas');
+    snap.width = W; snap.height = H;
+    snap.getContext('2d').drawImage(canvas, 0, 0);
+
+    action(); // swap the map / teleport the player NOW — render() draws the new state live from this frame on
+
+    const maxRadius = Math.hypot(W, H); // covers the far corner no matter where a bang lands
+    const speed = maxRadius / DOOR_RIPPLE_DURATION;
+    const bangs = [];
+    for(let i=0; i<DOOR_BANG_COUNT; i++){
+      bangs.push({ x: rng()*W, y: rng()*H, delay: i*DOOR_BANG_STAGGER, speed });
+    }
+
     doorTransition.active = true;
-    doorTransition.phase = 'closing';
     doorTransition.t = 0;
-    doorTransition.blocks = buildDoorTransitionBlocks();
-    doorTransition.action = action;
+    doorTransition.totalDuration = (DOOR_BANG_COUNT-1)*DOOR_BANG_STAGGER + DOOR_RIPPLE_DURATION;
+    doorTransition.bangs = bangs;
+    doorTransition.snapshot = snap;
   }
 
   function updateDoorTransition(dt){
     doorTransition.t += dt;
-    if(doorTransition.phase === 'closing'){
-      if(doorTransition.t >= DOOR_TRANSITION_DURATION){
-        doorTransition.action(); // screen is fully black now — safe to swap the map/teleport
-        doorTransition.phase = 'opening';
-        doorTransition.t = 0;
-      }
-    } else if(doorTransition.t >= DOOR_TRANSITION_DURATION){
-      doorTransition.active = false;
-    }
+    if(doorTransition.t >= doorTransition.totalDuration) doorTransition.active = false;
   }
 
   // Drawn from loop() right after render(), so it's still native-res
-  // (pre-CRT/LED post-process) — the blocks stay crisp, hard-edged squares
-  // no matter what the CRT curvature/scanlines do to them afterward.
+  // (pre-CRT/LED post-process) — stays crisp, hard-edged, no smoothing.
   function drawDoorTransition(){
-    const frac = Math.min(1, doorTransition.t / DOOR_TRANSITION_DURATION);
-    const blackedFrac = doorTransition.phase === 'closing' ? frac : (1-frac);
-    const count = Math.floor(blackedFrac * doorTransition.blocks.length);
+    const t = doorTransition.t;
+    const blocks = getDoorTransitionGrid();
     ctx.fillStyle = '#000';
-    for(let i=0; i<count; i++){
-      const b = doorTransition.blocks[i];
-      ctx.fillRect(b.x, b.y, NATIVE_TILE, NATIVE_TILE);
+    for(const b of blocks){
+      let revealed = false, band = false;
+      for(const bang of doorTransition.bangs){
+        const elapsed = t - bang.delay;
+        if(elapsed < 0) continue;
+        const radius = elapsed * bang.speed;
+        const dist = Math.hypot(b.cx-bang.x, b.cy-bang.y);
+        if(dist <= radius){ revealed = true; break; } // this bang's already swept past here — live new frame shows through, nothing to draw
+        if(dist <= radius + DOOR_BAND_WIDTH) band = true;
+      }
+      if(revealed) continue;
+      if(band) ctx.fillRect(b.x, b.y, NATIVE_TILE, NATIVE_TILE);
+      else ctx.drawImage(doorTransition.snapshot, b.x, b.y, NATIVE_TILE, NATIVE_TILE, b.x, b.y, NATIVE_TILE, NATIVE_TILE);
     }
   }
 
@@ -3693,7 +3722,7 @@
     e.alive = false;
     if(e.type === 'zombie'){
       if(e.record) return; // house interior enemy — no outdoor respawn, and zombies don't drop anything anyway
-      setTimeout(()=>{ const i = enemies.indexOf(e); if(i!==-1) enemies[i] = spawnZombie(); }, ZOMBIE_RESPAWN_MS);
+      // setTimeout(()=>{ const i = enemies.indexOf(e); if(i!==-1) enemies[i] = spawnZombie(); }, ZOMBIE_RESPAWN_MS); // zombies disabled — no respawn either
     } else {
       dropEnemyWeapon(e); // drops regardless of killer (player, another enemy, whatever) and regardless of indoors/outdoors
       if(Math.random() < HEALTH_DROP_CHANCE){
