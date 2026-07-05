@@ -37,7 +37,7 @@
     gap:10px;
     margin-bottom:12px;
   }
-  #fogToggleBtn, #interlaceToggleBtn, #crtToggleBtn, #resToggleBtn, #tileToggleBtn, #stdToggleBtn, #fpsToggleBtn{
+  #fogToggleBtn, #interlaceToggleBtn, #crtToggleBtn, #resToggleBtn, #tileToggleBtn, #stdToggleBtn, #fpsToggleBtn, #ledToggleBtn{
     font-family:'Courier New', monospace;
     font-size:11px;
     letter-spacing:1px;
@@ -53,21 +53,21 @@
     gap:8px;
     transition:border-color 0.15s, color 0.15s;
   }
-  #fogToggleBtn:hover, #interlaceToggleBtn:hover, #crtToggleBtn:hover, #resToggleBtn:hover, #tileToggleBtn:hover, #stdToggleBtn:hover, #fpsToggleBtn:hover{
+  #fogToggleBtn:hover, #interlaceToggleBtn:hover, #crtToggleBtn:hover, #resToggleBtn:hover, #tileToggleBtn:hover, #stdToggleBtn:hover, #fpsToggleBtn:hover, #ledToggleBtn:hover{
     border-color:var(--amber-dim);
   }
-  #fogToggleBtn .dot, #interlaceToggleBtn .dot, #crtToggleBtn .dot, #fpsToggleBtn .dot{
+  #fogToggleBtn .dot, #interlaceToggleBtn .dot, #crtToggleBtn .dot, #fpsToggleBtn .dot, #ledToggleBtn .dot{
     width:7px;
     height:7px;
     border-radius:50%;
     background:var(--teal);
     box-shadow:0 0 5px var(--teal);
   }
-  #fogToggleBtn.off .dot, #interlaceToggleBtn.off .dot, #crtToggleBtn.off .dot, #fpsToggleBtn.off .dot{
+  #fogToggleBtn.off .dot, #interlaceToggleBtn.off .dot, #crtToggleBtn.off .dot, #fpsToggleBtn.off .dot, #ledToggleBtn.off .dot{
     background:#555;
     box-shadow:none;
   }
-  #fogToggleBtn.off, #interlaceToggleBtn.off, #crtToggleBtn.off, #fpsToggleBtn.off{
+  #fogToggleBtn.off, #interlaceToggleBtn.off, #crtToggleBtn.off, #fpsToggleBtn.off, #ledToggleBtn.off{
     color:#8a8874;
   }
   #gameWrap{
@@ -120,6 +120,29 @@
     z-index:3;
     pointer-events:none;
     image-rendering:auto;
+    display:none;
+  }
+
+  /* LED subpixel simulation layer: internal buffer is 3x the game canvas'
+     width (one column per R/G/B sub-rectangle) and the same height, so each
+     source pixel becomes exactly three vertical stripes. Sits above BOTH
+     the game canvas and the CRT layer (highest z-index of the three) since
+     it needs to be the final visible thing when it's on. It samples pixels
+     straight from the base game canvas, not the CRT-processed one, so if
+     CRT mode is also on this simply covers it — the two are visually
+     exclusive rather than combined. Pixelated, same as the base canvas, so
+     the stripe edges stay hard rather than blurring together. Hidden unless
+     the LED toggle is on. */
+  #subpixelCanvas{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    z-index:4;
+    pointer-events:none;
+    image-rendering:pixelated;
+    image-rendering:-moz-crisp-edges;
+    image-rendering:crisp-edges;
     display:none;
   }
 
@@ -259,6 +282,9 @@
   <button id="fpsToggleBtn" type="button" aria-pressed="false">
     <span class="dot"></span><span id="fpsToggleLabel">View: Top-Down</span>
   </button>
+  <button id="ledToggleBtn" type="button" aria-pressed="false" title="Simulates the physical subpixel structure of an LED/LCD screen: every pixel splits into its red, green and blue vertical stripes, each one dimmed to that channel's actual brightness.">
+    <span class="dot"></span><span id="ledToggleLabel">LED Pixels: Off</span>
+  </button>
   <label style="display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--amber);">
     Music
     <input type="range" id="musicVolumeSlider" min="0" max="100" value="40" title="Music volume" style="accent-color:var(--amber); vertical-align:middle;">
@@ -272,6 +298,7 @@
 <div id="gameWrap">
   <div id="gameContainer">
     <canvas id="gameCanvas" width="512" height="448"></canvas>
+    <canvas id="subpixelCanvas"></canvas>
     <canvas id="crtCanvas"></canvas>
 
     <!-- Weapon HUD (name + ammo) is drawn directly on the canvas now, out
@@ -340,6 +367,14 @@
   const [CANVAS_W, CANVAS_H] = RES_DIMENSIONS[resMode][tvStandard];
   canvas.width = CANVAS_W;
   canvas.height = CANVAS_H;
+
+  // LED subpixel overlay buffer: 3x the width, same height — one internal
+  // column per R/G/B sub-rectangle per source pixel. Sized here, right next
+  // to the main canvas, so it's ready before the LED toggle below ever runs.
+  const subpixelCanvas = document.getElementById('subpixelCanvas');
+  const subpixelCtx = subpixelCanvas.getContext('2d');
+  subpixelCanvas.width = CANVAS_W * 3;
+  subpixelCanvas.height = CANVAS_H;
 
   // Tile grid size (8x8 vs 16x16) is its own independent choice now, not
   // derived from resMode. Real SNES games could run either tile size in
@@ -457,6 +492,9 @@
     // there's no technical reason to restrict the control to hi-res only.
   }
 
+  // (LED subpixel toggle lives after the CRT setup below, since it needs
+  // to know whether CRT is active to decide which implementation to use.)
+
   const container = document.getElementById('gameContainer');
   const gameWrap = document.getElementById('gameWrap');
   const W = canvas.width, H = canvas.height;
@@ -507,6 +545,17 @@
   // smooth-sampled canvas (no image-rendering:pixelated) sized to its real
   // on-screen pixel size, so the distortion/scanlines read at native
   // display resolution instead of blowing up game-resolution pixels.
+  // LED subpixel simulation state, declared here (before CRT setup) because
+  // the CRT shader wiring below and refreshCRTButton()'s visibility check
+  // both need to read it — see the full LED toggle section further down for
+  // the button wiring and the flat-mode fallback.
+  const LED_STORAGE_KEY = 'perimeter_ledPixelsEnabled';
+  let ledPixelsEnabled = false;
+  try{
+    const saved = localStorage.getItem(LED_STORAGE_KEY);
+    if(saved !== null) ledPixelsEnabled = saved === '1';
+  }catch(e){ /* localStorage unavailable — default off */ }
+
   const CRT_STORAGE_KEY = 'perimeter_crtEnabled';
   let crtEnabled = true;
   try{
@@ -552,6 +601,7 @@
       uniform float u_scanline;
       uniform float u_vignette;
       uniform float u_mask;
+      uniform float u_ledSplit;
 
       vec2 barrel(vec2 uv, float k){
         vec2 cc = uv - 0.5;
@@ -578,12 +628,27 @@
         float scanMul = mix(1.0, 0.45 + 0.55 * abs(sl), u_scanline);
         color *= scanMul;
 
-        // Light per-output-pixel-column RGB phosphor triad.
-        float col = mod(gl_FragCoord.x, 3.0);
-        vec3 maskColor = (col < 1.0) ? vec3(1.1, 0.85, 0.9)
-                        : (col < 2.0) ? vec3(0.85, 1.1, 0.85)
-                                      : vec3(0.9, 0.85, 1.1);
-        color *= mix(vec3(1.0), maskColor, u_mask);
+        if(u_ledSplit > 0.5){
+          // LED/LCD subpixel simulation, combined mode: 'uv' here is the
+          // SAME barrel-distorted, source-space coordinate already used to
+          // sample the texture above — so slicing it into three columns per
+          // source pixel bends exactly along with the curvature instead of
+          // being a flat overlay laid on top afterward. Each fragment keeps
+          // only its own channel (dimmed to that channel's real value,
+          // scanlines and all), the other two go dark, same as a real
+          // sub-pixel would.
+          float subCell = mod(floor(uv.x * u_srcRes.x * 3.0), 3.0);
+          if(subCell < 1.0) color = vec3(color.r, 0.0, 0.0);
+          else if(subCell < 2.0) color = vec3(0.0, color.g, 0.0);
+          else color = vec3(0.0, 0.0, color.b);
+        } else {
+          // Light per-output-pixel-column RGB phosphor triad.
+          float col = mod(gl_FragCoord.x, 3.0);
+          vec3 maskColor = (col < 1.0) ? vec3(1.1, 0.85, 0.9)
+                          : (col < 2.0) ? vec3(0.85, 1.1, 0.85)
+                                        : vec3(0.9, 0.85, 1.1);
+          color *= mix(vec3(1.0), maskColor, u_mask);
+        }
 
         // Soft vignette toward the corners.
         vec2 vc = v_uv - 0.5;
@@ -634,7 +699,8 @@
       curvature: gl.getUniformLocation(crtProgram, 'u_curvature'),
       scanline: gl.getUniformLocation(crtProgram, 'u_scanline'),
       vignette: gl.getUniformLocation(crtProgram, 'u_vignette'),
-      mask: gl.getUniformLocation(crtProgram, 'u_mask')
+      mask: gl.getUniformLocation(crtProgram, 'u_mask'),
+      ledSplit: gl.getUniformLocation(crtProgram, 'u_ledSplit')
     };
     crtReady = true;
   }
@@ -667,6 +733,7 @@
     gl.uniform1f(crtUniforms.scanline, 0.55);
     gl.uniform1f(crtUniforms.vignette, 0.30);
     gl.uniform1f(crtUniforms.mask, 0.20);
+    gl.uniform1f(crtUniforms.ledSplit, ledPixelsEnabled ? 1.0 : 0.0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -679,6 +746,7 @@
     crtToggleBtn.setAttribute('aria-pressed', String(active));
     if(crtToggleLabel) crtToggleLabel.textContent = 'CRT: ' + (crtReady ? (crtEnabled ? 'On' : 'Off') : 'N/A');
     if(crtCanvas) crtCanvas.style.display = active ? 'block' : 'none';
+    updateLedVisibility();
   }
   refreshCRTButton();
   if(crtToggleBtn){
@@ -688,6 +756,50 @@
       crtEnabled = !crtEnabled;
       try{ localStorage.setItem(CRT_STORAGE_KEY, crtEnabled ? '1' : '0'); }catch(e){}
       refreshCRTButton();
+    });
+  }
+
+  // ---------------- LED subpixel simulation toggle (saved in the browser) ----------------
+  // Simulates the physical subpixel layout of an LED/LCD panel: every game
+  // pixel splits into three vertical sub-rectangles — red, green, blue —
+  // each dimmed to how "on" that channel actually is in the source pixel,
+  // rather than the pixel just being one flat blended color.
+  //
+  // Two implementations, picked automatically depending on whether CRT mode
+  // is also active:
+  //  - CRT on: the split happens INSIDE the CRT fragment shader (see
+  //    u_ledSplit in initCRT() above), using the same barrel-distorted
+  //    coordinate already used to sample the source texture — so the
+  //    stripe boundaries curve along with the tube curvature, for free, on
+  //    the GPU, at full display resolution.
+  //  - CRT off/unavailable: falls back to a flat 2D-canvas version that
+  //    reads the finished frame and rewrites it into a 3x-wide subpixel
+  //    buffer (see drawLedPixels() near the render loop) — sharp and
+  //    un-warped, drawn into #subpixelCanvas.
+  const ledToggleBtn = document.getElementById('ledToggleBtn');
+  const ledToggleLabel = document.getElementById('ledToggleLabel');
+  // Only the flat fallback needs #subpixelCanvas shown — when CRT is doing
+  // the combined curved version, the shader draws straight into #crtCanvas
+  // (already visible via refreshCRTButton), so the flat overlay must stay
+  // hidden or it'd just sit on top covering the curved result.
+  function updateLedVisibility(){
+    const crtActive = crtEnabled && crtReady;
+    const flatLed = ledPixelsEnabled && !crtActive;
+    if(subpixelCanvas) subpixelCanvas.style.display = flatLed ? 'block' : 'none';
+  }
+  function refreshLedButton(){
+    if(!ledToggleBtn) return;
+    ledToggleBtn.classList.toggle('off', !ledPixelsEnabled);
+    ledToggleBtn.setAttribute('aria-pressed', String(ledPixelsEnabled));
+    if(ledToggleLabel) ledToggleLabel.textContent = 'LED Pixels: ' + (ledPixelsEnabled ? 'On' : 'Off');
+    updateLedVisibility();
+  }
+  refreshLedButton();
+  if(ledToggleBtn){
+    ledToggleBtn.addEventListener('click', function(){
+      ledPixelsEnabled = !ledPixelsEnabled;
+      try{ localStorage.setItem(LED_STORAGE_KEY, ledPixelsEnabled ? '1' : '0'); }catch(e){}
+      refreshLedButton();
     });
   }
 
@@ -4630,7 +4742,11 @@
     last = now;
     if(fpsMode && addon3D){ addon3D.update(dt); addon3D.render(); }
     else { update(dt); render(); }
-    if(crtEnabled && crtReady) drawCRTFrame();
+    const crtActive = crtEnabled && crtReady;
+    if(crtActive) drawCRTFrame();
+    // Flat fallback only — when CRT is active it already bakes the LED
+    // split into the shader above, combined with the curvature.
+    if(ledPixelsEnabled && !crtActive) drawLedPixels();
     requestAnimationFrame(loop);
   }
 
@@ -5951,6 +6067,37 @@
     // right column: weapon name (top), status (bottom)
     drawTileText(hudInfo.nameTxt, 136, row1, hudInfo.nameColor);
     drawTileText(hudInfo.statusTxt, 136, row2, hudInfo.statusColor);
+  }
+
+  // LED subpixel simulation: takes the finished frame and, for every source
+  // pixel, writes three columns into the 3x-wide subpixel buffer — one lit
+  // purely in that pixel's red channel, one purely green, one purely blue —
+  // each scaled to that channel's actual intensity so a bright pixel's
+  // stripes glow strongly and a dim one's barely light up at all, same as
+  // real LED/LCD subpixels do. Reads straight off the base game canvas
+  // (not the CRT-processed layer), and — being the topmost layer — simply
+  // covers CRT mode's output if that's also on, rather than combining with
+  // it. Reused, persistent ImageData object (sized once at setup) so this
+  // is just typed-array writes every frame, no per-pixel draw calls and no
+  // per-frame allocation.
+  const ledImageData = subpixelCtx.createImageData(CANVAS_W * 3, CANVAS_H);
+  const ledOut = ledImageData.data;
+  function drawLedPixels(){
+    const src = ctx.getImageData(0, 0, W, H).data;
+    const outW = W * 3;
+    for(let y = 0; y < H; y++){
+      const srcRow = y * W * 4;
+      const outRow = y * outW * 4;
+      for(let x = 0; x < W; x++){
+        const si = srcRow + x * 4;
+        const r = src[si], g = src[si + 1], b = src[si + 2], a = src[si + 3];
+        const oi = outRow + x * 12; // 3 sub-pixels * 4 channels each
+        ledOut[oi]     = r; ledOut[oi + 1] = 0; ledOut[oi + 2] = 0; ledOut[oi + 3] = a; // red stripe
+        ledOut[oi + 4] = 0; ledOut[oi + 5] = g; ledOut[oi + 6] = 0; ledOut[oi + 7] = a; // green stripe
+        ledOut[oi + 8] = 0; ledOut[oi + 9] = 0; ledOut[oi + 10] = b; ledOut[oi + 11] = a; // blue stripe
+      }
+    }
+    subpixelCtx.putImageData(ledImageData, 0, 0);
   }
 
   function render(){
