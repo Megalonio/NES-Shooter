@@ -3315,6 +3315,11 @@
         crates.splice(i,1);
       }
     }
+    for(let i=droppedWeapons.length-1; i>=0; i--){
+      const d = droppedWeapons[i];
+      const row = Math.floor(d.y/TILE);
+      if(row >= INTERIOR_ROW0 && row < INTERIOR_ROW0+SECTOR_TILES_Y) droppedWeapons.splice(i,1);
+    }
     player.x = house.standCol*TILE+TILE/2;
     player.y = house.standRow*TILE+TILE/2;
     insideHouse = null;
@@ -3461,11 +3466,12 @@
   // wrong slot or, worse, leaves a hole that later code crashes reading.
   function onEnemyKilled(e, idx){
     e.alive = false;
-    if(e.record) return; // house interior enemy — see comment above, no outdoor respawn
     if(e.type === 'zombie'){
+      if(e.record) return; // house interior enemy — no outdoor respawn, and zombies don't drop anything anyway
       setTimeout(()=>{ const i = enemies.indexOf(e); if(i!==-1) enemies[i] = spawnZombie(); }, ZOMBIE_RESPAWN_MS);
     } else {
-      dropEnemyWeapon(e);
+      dropEnemyWeapon(e); // drops regardless of killer (player, another enemy, whatever) and regardless of indoors/outdoors
+      if(e.record) return; // house interior enemy — its death is remembered on house.interior via exitHouse, no floating outdoor respawn
       setTimeout(()=>{ const i = enemies.indexOf(e); if(i!==-1) enemies[i] = spawnEnemy(); }, 3000);
     }
   }
@@ -4268,14 +4274,26 @@
     alertToSound(fromX, fromY);
   }
 
-  // See fireBullet above for when this fires. Only touches enemies already
-  // in 'investigate' or 'sweep' — a 'chase' enemy already has real LOS and
-  // shouldn't get yanked off it, and an 'idle' enemy has no reason yet to
-  // care about a sound.
+  // See fireBullet above for when this fires. Redirects any already-alerted
+  // (investigating/sweeping) enemy within earshot straight away, same as
+  // before — but a gunshot is loud enough that it can also snap a fully
+  // oblivious ('idle') enemy into searching from scratch, just at a shorter
+  // range than an already-listening enemy would pick it up from (and
+  // muffled further if a wall sits between the shot and the listener).
+  // 'chase' (already has real LOS) and 'flee' (busy running) ignore this,
+  // same as they ignore footsteps.
+  const SHOT_HEAR_RANGE_IDLE = 24 * TILE;
   function alertToSound(x, y){
     for(const e of enemies){
-      if(!e.alive || !e.alertState || e.alertState === 'idle' || e.alertState === 'chase') continue;
-      if(Math.hypot(e.x-x, e.y-y) > SOUND_RANGE.shot) continue;
+      if(!e.alive || !e.alertState || e.alertState === 'chase' || e.alertState === 'flee') continue;
+      if(e.alertState === 'idle'){
+        const clear = canSee(e.x, e.y, x, y, SHOT_HEAR_RANGE_IDLE);
+        const range = clear ? SHOT_HEAR_RANGE_IDLE : SHOT_HEAR_RANGE_IDLE*0.4;
+        if(Math.hypot(e.x-x, e.y-y) > range) continue;
+        e.aware = true;
+      } else {
+        if(Math.hypot(e.x-x, e.y-y) > SOUND_RANGE.shot) continue;
+      }
       e.lastSeenX = x; e.lastSeenY = y;
       e.alertState = 'investigate';
       e.investigateTimer = INVESTIGATE_TIME;
