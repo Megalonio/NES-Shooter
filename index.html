@@ -1329,7 +1329,13 @@
       e.pathTargetX = e.lastSeenX; e.pathTargetY = e.lastSeenY;
     }
     const distFinal = Math.hypot(e.lastSeenX-e.x, e.lastSeenY-e.y);
-    if(distFinal <= INVESTIGATE_ARRIVE_DIST) return true;
+    // Only treat straight-line closeness as "arrived" once there's no more
+    // path left to walk — i.e. no route was needed, or they're already at
+    // the last waypoint. Without this, a target that's straight-line close
+    // but on the other side of a wall (e.g. shot through a door) would let
+    // an enemy "arrive" without ever taking a single step toward it.
+    const atFinalWaypoint = !e.path || e.path.length === 0 || e.pathIndex >= e.path.length-1;
+    if(distFinal <= INVESTIGATE_ARRIVE_DIST && atFinalWaypoint) return true;
     let moveAngle = Math.atan2(e.lastSeenY-e.y, e.lastSeenX-e.x); // fallback: straight line, used only if pathfinding couldn't find a route at all
     if(e.path && e.path.length){
       let wp = e.path[e.pathIndex];
@@ -3215,9 +3221,11 @@
       wanderAngle, wanderTimer: 0,
       facing: wanderAngle, // which way they're currently looking — see ENEMY_VIEW_ARC_HALF below, can't detect the player behind them
       aware: false,        // once they've spotted the player through the facing cone, LOS alone keeps them locked on through chase/investigate/sweep — only cleared when sweep gives up, requiring the cone check again to re-spot
-      alertState: 'idle',  // 'idle' (wander) -> 'chase' (has LOS) -> 'investigate' (lost LOS, pathing to last seen spot) -> 'sweep' (lingering/looking around) -> back to 'idle'
+      alertState: 'idle',  // 'idle' (wander) -> 'chase' (has LOS) -> 'investigate' (lost LOS, pathing to last seen spot) -> 'sweep' (lingering/looking around) -> back to 'idle'; 'flee' (panicked, running from a hit) branches off separately
+      archetype: pickArchetype(), // how this particular gunman reacts to getting hit — see pickArchetype above
       lastSeenX: 0, lastSeenY: 0,
-      investigateTimer: 0, sweepTimer: 0, sweepDir: 1, reactionShootTimer: 0,
+      investigateTimer: 0, sweepTimer: 0, sweepDir: 1, sweepStepTimer: 0, sweepStepAngle: 0, reactionShootTimer: 0,
+      fleeTimer: 0, fleeAngle: 0, flinchTimer: 0, chargeTimer: 0, chargeSpeedMul: 1, blindFireCd: 0,
       path: null, pathIndex: 0, pathTargetX: null, pathTargetY: null,
       shotCd: 0,
       ammo: wd.magSize, magSize: wd.magSize, reloading: false, reloadTimer: 0, // same magazine/reload limits the player lives with — see the reload branch below
@@ -3338,6 +3346,31 @@
   const REACTION_SHOOT_WINDOW = 1.2;
   const INVESTIGATE_ARRIVE_DIST = 12;
   const SWEEP_TURN_SPEED = 1.4; // rad/s, facing sweeps back and forth while lingering
+
+  // ---- Getting hit: how a person actually reacts to taking a round (or a
+  // knife) depends on who they are and how bad it is, not one flat script.
+  // Each gunman rolls one of three archetypes at spawn (see pickArchetype):
+  //   'rusher'   — adrenaline over caution: charges the source faster than
+  //                normal and sprays fire on the way in.
+  //   'tactical' — a half-beat flinch/duck first, then advances carefully,
+  //                still shooting back the whole time.
+  //   'coward'   — most likely to just run: bolts away from the hit and,
+  //                if hurt badly enough or blindsided, may keep bolting.
+  // Zombies skip all of this — no fear response, no ranged fire, they just
+  // charge harder, like a wounded animal would.
+  const FLEE_TIME = 4; // how long a panicked enemy runs before catching their breath
+  const FLEE_HP_FRAC_THRESHOLD = 0.3; // below this much HP, panic becomes much more likely regardless of archetype
+  const RUSHER_CHARGE_SPEED_MUL = 1.4; // adrenaline sprint speed while charging a fresh hit
+  const RUSHER_CHARGE_TIME = 3; // how long that speed boost lasts before settling back to normal investigate pace
+  const TACTICAL_FLINCH_TIME = 0.35; // brief duck/brace before a tactical shooter does anything else
+  const BLIND_FIRE_COOLDOWN_RANGE = [0.5, 1.1]; // random cadence of suppressing fire toward an unseen shooter — bullets already punch through walls (wallRetention), so firing blind through one is consistent with how the rest of combat works
+  const SWEEP_STEP_INTERVAL = [0.5, 0.9]; // how often a sweeping enemy picks a new nearby spot/angle to actually step toward and check, instead of standing rooted in place
+  function pickArchetype(){
+    const r = Math.random();
+    if(r < 0.30) return 'rusher';
+    if(r < 0.75) return 'tactical';
+    return 'coward';
+  }
   function pickForestSpawn(){
     if(FOREST_FLOOR.length) return FOREST_FLOOR[Math.floor(Math.random()*FOREST_FLOOR.length)];
     return pickHouseSpawn(); // fallback if a map ever rolls no forest at all
@@ -3357,7 +3390,8 @@
       aware: false,
       alertState: 'idle',
       lastSeenX: 0, lastSeenY: 0,
-      investigateTimer: 0, sweepTimer: 0, sweepDir: 1,
+      investigateTimer: 0, sweepTimer: 0, sweepDir: 1, sweepStepTimer: 0, sweepStepAngle: 0,
+      chargeTimer: 0, chargeSpeedMul: 1, // wounded-animal adrenaline burst after taking a hit — see enemyGotShot
       path: null, pathIndex: 0, pathTargetX: null, pathTargetY: null,
       meleeCd: 0,
       soundTimer: 0,
@@ -4246,21 +4280,76 @@
   // gunfire — a bullet that actually lands (even one that punched through
   // a wall to do it) tells an enemy almost exactly where the player is.
   // Unlike a normal LOS loss, this skips straight past "investigate" being
-  // gated on line of sight: they instantly know roughly where you are,
-  // snap off a reflexive shot back at the wall/direction the round came
-  // from (if they're carrying a gun — zombies have nothing to shoot back
-  // with), and start pushing toward you to reacquire real line of sight.
+  // gated on line of sight: they instantly know roughly where you are.
+  // What they DO about that varies by archetype (see pickArchetype) and how
+  // hurt/blindsided they are — see the reaction table in the comments below.
   function enemyGotShot(e, bullet){
+    enemyGotHit(e, bullet.originX, bullet.originY, bullet);
+  }
+  // sourceX/sourceY is wherever the hit came from (a bullet's muzzle
+  // position, or the player's own position for a melee hit) — `bullet` is
+  // optional and only used for the reflexive shot-back angle, so melee hits
+  // can share this same reaction logic without a fake bullet object.
+  function enemyGotHit(e, sourceX, sourceY, bullet){
     e.aware = true;
-    e.alertState = 'investigate';
     e.lastSeenX = player.x; e.lastSeenY = player.y;
+
+    // Zombies: no fear, no gun, no decision to make — getting hurt just
+    // makes them charge harder, like a wounded animal would.
+    if(!e.weaponDef){
+      e.alertState = 'investigate';
+      e.investigateTimer = INVESTIGATE_TIME;
+      e.chargeTimer = RUSHER_CHARGE_TIME;
+      e.chargeSpeedMul = RUSHER_CHARGE_SPEED_MUL;
+      return;
+    }
+
+    const hpFrac = e.hp / e.maxHp;
+    const hadLOSAtHit = canSee(e.x, e.y, player.x, player.y, 320);
+
+    // Pain and fear can override aggression outright. Cowards bolt easily;
+    // even a rusher can break if they're hurt badly enough. Getting hit by
+    // someone you never even saw coming nudges everyone a bit further
+    // toward flight — that's the scarier version of "getting shot."
+    const panicChance =
+      (e.archetype === 'coward' ? 0.7 : e.archetype === 'tactical' ? 0.35 : 0.12)
+      + (hpFrac < FLEE_HP_FRAC_THRESHOLD ? 0.4 : 0)
+      + (!hadLOSAtHit ? 0.15 : 0);
+    if(Math.random() < panicChance){
+      e.alertState = 'flee';
+      e.fleeTimer = FLEE_TIME;
+      e.fleeAngle = Math.atan2(e.y-sourceY, e.x-sourceX); // straight away from wherever the hit came from
+      alertToSound(e.x, e.y); // their panic drags any nearby searching enemy toward this spot too, same as a shout would
+      return;
+    }
+
+    e.alertState = 'investigate';
     e.investigateTimer = INVESTIGATE_TIME;
     e.reactionShootTimer = REACTION_SHOOT_WINDOW;
-    if(e.weaponDef && !e.reloading && e.ammo>0){
-      const backAngle = Math.atan2(bullet.originY-e.y, bullet.originX-e.x);
+    e.blindFireCd = 0.2 + Math.random()*0.3;
+
+    if(e.archetype === 'rusher'){
+      // Adrenaline over caution: charges straight at the source faster
+      // than a normal walk instead of pathing over there carefully.
+      e.chargeTimer = RUSHER_CHARGE_TIME;
+      e.chargeSpeedMul = RUSHER_CHARGE_SPEED_MUL;
+    } else if(e.archetype === 'tactical'){
+      // A trained reaction: duck/brace for a half-beat before doing
+      // anything else, rather than instantly snapping into motion.
+      e.flinchTimer = TACTICAL_FLINCH_TIME;
+    }
+
+    // Reflexive shot straight back at wherever the hit came from — real
+    // even when they never actually saw the shooter, just the impact
+    // direction. Bullets already punch through walls in this game (see
+    // wallRetention), so firing blind through one is consistent with how
+    // the rest of combat already works.
+    if(!e.reloading && e.ammo>0){
+      const backAngle = Math.atan2(sourceY-e.y, sourceX-e.x);
       enemyFireShotAt(e, backAngle);
     }
   }
+
 
   function angleDiff(a, b){
     return Math.atan2(Math.sin(a-b), Math.cos(a-b));
@@ -4306,6 +4395,8 @@
           e.y += Math.sin(angle)*10;
           if(e.hp<=0){
             onEnemyKilled(e, ei);
+          } else {
+            enemyGotHit(e, player.x, player.y); // getting stabbed provokes the same flee/rush/tactical reaction a gunshot would, just sourced from melee range instead of a bullet
           }
         }
       }
@@ -4850,20 +4941,33 @@
           e.investigateTimer = INVESTIGATE_TIME;
         } else if(e.alertState === 'investigate'){
           e.investigateTimer -= dt;
-          const arrived = advanceInvestigatePath(e, dt, e.speed);
+          const speedMul = e.chargeTimer > 0 ? e.chargeSpeedMul : 1;
+          if(e.chargeTimer > 0) e.chargeTimer -= dt;
+          const arrived = advanceInvestigatePath(e, dt, e.speed*speedMul);
           if(arrived || e.investigateTimer <= 0){
             // Arrived at (or gave up reaching) the last known spot — linger
             // and look around a bit before fully giving up the chase.
             e.alertState = 'sweep';
             e.sweepTimer = SWEEP_TIME;
             e.sweepDir = Math.random()<0.5 ? -1 : 1;
+            e.sweepStepTimer = 0;
             e.moving = false;
             e.path = null;
           }
         } else if(e.alertState === 'sweep'){
           e.sweepTimer -= dt;
+          e.sweepStepTimer -= dt;
+          if(e.sweepStepTimer <= 0){
+            // Pick a new nearby spot/angle to shuffle toward and check —
+            // a real search involves stepping around a room, not standing
+            // dead still on one tile while just turning your head.
+            e.sweepStepAngle = e.facing + (Math.random()-0.5)*2.4;
+            e.sweepStepTimer = SWEEP_STEP_INTERVAL[0] + Math.random()*(SWEEP_STEP_INTERVAL[1]-SWEEP_STEP_INTERVAL[0]);
+          }
           e.facing += e.sweepDir*SWEEP_TURN_SPEED*dt;
-          e.moving = false;
+          e.moving = true;
+          e.x += Math.cos(e.sweepStepAngle)*e.speed*0.35*dt;
+          e.y += Math.sin(e.sweepStepAngle)*e.speed*0.35*dt;
           if(e.sweepTimer <= 0){
             e.alertState = 'idle';
             e.aware = false;
@@ -4903,7 +5007,36 @@
           e.reloadTimer -= dt;
           if(e.reloadTimer<=0){ e.reloading = false; e.ammo = e.magSize; }
         }
-        if(enemyHasLOS){
+        if(e.alertState === 'flee'){
+          // Panicked: running straight away from wherever the hit came
+          // from, not toward the player at all — occasionally snapping off
+          // a wild, unaimed shot back over their shoulder rather than
+          // stopping to actually fight.
+          e.fleeTimer -= dt;
+          e.facing = e.fleeAngle;
+          if(Math.abs(Math.cos(e.fleeAngle)) > 0.01) e.facingRight = Math.cos(e.fleeAngle) >= 0;
+          e.moving = true;
+          e.x += Math.cos(e.fleeAngle)*e.speed*e.speedMul*1.15*dt; // fear buys a little extra hustle over a normal walk
+          e.y += Math.sin(e.fleeAngle)*e.speed*e.speedMul*1.15*dt;
+          if(!e.reloading){
+            e.shotCd -= dt;
+            if(e.shotCd<=0 && e.ammo>0 && Math.random()<0.25){
+              const wildAngle = e.fleeAngle + Math.PI + (Math.random()-0.5)*0.9;
+              enemyFireShotAt(e, wildAngle);
+              e.shotCd = (wd ? wd.cooldown : 0.5) * 2.5; // sloppy, infrequent panic-fire, not a real firefight
+            }
+          }
+          if(e.fleeTimer <= 0){
+            // Caught their breath — glance around before either spotting
+            // the player again (enemyHasLOS will catch that next frame) or
+            // settling back into idle wandering.
+            e.alertState = 'sweep';
+            e.sweepTimer = SWEEP_TIME;
+            e.sweepDir = Math.random()<0.5 ? -1 : 1;
+            e.sweepStepTimer = 0;
+            e.moving = false;
+          }
+        } else if(enemyHasLOS){
           e.aware = true;
           e.alertState = 'chase';
           e.lastSeenX = player.x; e.lastSeenY = player.y;
@@ -4937,29 +5070,62 @@
           const distToLast = Math.hypot(e.lastSeenX-e.x, e.lastSeenY-e.y);
           const aToLast = Math.atan2(e.lastSeenY-e.y, e.lastSeenX-e.x);
           e.investigateTimer -= dt;
-          if(e.reactionShootTimer > 0){
-            e.reactionShootTimer -= dt;
-            if(!e.reloading){
-              e.shotCd -= dt;
-              if(distToLast < 300 && e.shotCd<=0 && e.ammo>0 && canSee(e.x, e.y, e.lastSeenX, e.lastSeenY, 320)){
-                enemyFireShotAt(e, aToLast);
+          if(e.flinchTimer > 0){
+            // The half-beat a trained shooter spends ducking/bracing right
+            // after taking a hit they didn't see coming, before actually
+            // reacting to it — not just teleporting straight into motion.
+            e.flinchTimer -= dt;
+            e.moving = false;
+          } else {
+            if(e.reactionShootTimer > 0){
+              e.reactionShootTimer -= dt;
+              if(!e.reloading){
+                e.shotCd -= dt;
+                if(distToLast < 300 && e.shotCd<=0 && e.ammo>0 && canSee(e.x, e.y, e.lastSeenX, e.lastSeenY, 320)){
+                  enemyFireShotAt(e, aToLast);
+                }
               }
             }
-          }
-          const arrived = advanceInvestigatePath(e, dt, e.speed*e.speedMul);
-          if(arrived || e.investigateTimer <= 0){
-            // Arrived at (or gave up reaching) the last known spot — linger
-            // and look around a bit before fully giving up the chase.
-            e.alertState = 'sweep';
-            e.sweepTimer = SWEEP_TIME;
-            e.sweepDir = Math.random()<0.5 ? -1 : 1;
-            e.moving = false;
-            e.path = null;
+            // Blind suppressing fire: someone who just got hit through cover
+            // or from an angle they never saw keeps tossing rounds roughly
+            // toward the source even with no real sightline — bullets already
+            // punch through walls (wallRetention), so this is a real
+            // "spraying through the door" moment, not a cheat.
+            if(!e.reloading && e.ammo>0){
+              e.blindFireCd -= dt;
+              if(e.blindFireCd <= 0 && distToLast < 260){
+                enemyFireShotAt(e, aToLast + (Math.random()-0.5)*0.5);
+                e.blindFireCd = BLIND_FIRE_COOLDOWN_RANGE[0] + Math.random()*(BLIND_FIRE_COOLDOWN_RANGE[1]-BLIND_FIRE_COOLDOWN_RANGE[0]);
+              }
+            }
+            const chargeMul = e.chargeTimer > 0 ? e.chargeSpeedMul : 1;
+            if(e.chargeTimer > 0) e.chargeTimer -= dt;
+            const arrived = advanceInvestigatePath(e, dt, e.speed*e.speedMul*chargeMul);
+            if(arrived || e.investigateTimer <= 0){
+              // Arrived at (or gave up reaching) the last known spot — linger
+              // and look around a bit before fully giving up the chase.
+              e.alertState = 'sweep';
+              e.sweepTimer = SWEEP_TIME;
+              e.sweepDir = Math.random()<0.5 ? -1 : 1;
+              e.sweepStepTimer = 0;
+              e.moving = false;
+              e.path = null;
+            }
           }
         } else if(e.alertState === 'sweep'){
           e.sweepTimer -= dt;
+          e.sweepStepTimer -= dt;
+          if(e.sweepStepTimer <= 0){
+            // Pick a new nearby spot/angle to shuffle toward and check —
+            // a real search means stepping around a room and checking
+            // corners, not standing dead still just turning your head.
+            e.sweepStepAngle = e.facing + (Math.random()-0.5)*2.4;
+            e.sweepStepTimer = SWEEP_STEP_INTERVAL[0] + Math.random()*(SWEEP_STEP_INTERVAL[1]-SWEEP_STEP_INTERVAL[0]);
+          }
           e.facing += e.sweepDir*SWEEP_TURN_SPEED*dt;
-          e.moving = false;
+          e.moving = true;
+          e.x += Math.cos(e.sweepStepAngle)*e.speed*e.speedMul*0.35*dt;
+          e.y += Math.sin(e.sweepStepAngle)*e.speed*e.speedMul*0.35*dt;
           if(e.sweepTimer <= 0){
             e.alertState = 'idle';
             e.aware = false;
