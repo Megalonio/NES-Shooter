@@ -37,7 +37,7 @@
     gap:10px;
     margin-bottom:12px;
   }
-  #fogToggleBtn, #interlaceToggleBtn, #crtToggleBtn, #resToggleBtn, #tileToggleBtn, #stdToggleBtn, #fpsToggleBtn, #ledToggleBtn, #nesToggleBtn{
+  #fogToggleBtn, #interlaceToggleBtn, #crtToggleBtn, #resToggleBtn, #tileToggleBtn, #fpsToggleBtn, #ledToggleBtn, #nesToggleBtn, #ntscToggleBtn{
     font-family:'Courier New', monospace;
     font-size:11px;
     letter-spacing:1px;
@@ -53,21 +53,21 @@
     gap:8px;
     transition:border-color 0.15s, color 0.15s;
   }
-  #fogToggleBtn:hover, #interlaceToggleBtn:hover, #crtToggleBtn:hover, #resToggleBtn:hover, #tileToggleBtn:hover, #stdToggleBtn:hover, #fpsToggleBtn:hover, #ledToggleBtn:hover, #nesToggleBtn:hover{
+  #fogToggleBtn:hover, #interlaceToggleBtn:hover, #crtToggleBtn:hover, #resToggleBtn:hover, #tileToggleBtn:hover, #fpsToggleBtn:hover, #ledToggleBtn:hover, #nesToggleBtn:hover, #ntscToggleBtn:hover{
     border-color:var(--amber-dim);
   }
-  #fogToggleBtn .dot, #interlaceToggleBtn .dot, #crtToggleBtn .dot, #fpsToggleBtn .dot, #ledToggleBtn .dot, #nesToggleBtn .dot{
+  #fogToggleBtn .dot, #interlaceToggleBtn .dot, #crtToggleBtn .dot, #fpsToggleBtn .dot, #ledToggleBtn .dot, #nesToggleBtn .dot, #ntscToggleBtn .dot{
     width:7px;
     height:7px;
     border-radius:50%;
     background:var(--teal);
     box-shadow:0 0 5px var(--teal);
   }
-  #fogToggleBtn.off .dot, #interlaceToggleBtn.off .dot, #crtToggleBtn.off .dot, #fpsToggleBtn.off .dot, #ledToggleBtn.off .dot, #nesToggleBtn.off .dot{
+  #fogToggleBtn.off .dot, #interlaceToggleBtn.off .dot, #crtToggleBtn.off .dot, #fpsToggleBtn.off .dot, #ledToggleBtn.off .dot, #nesToggleBtn.off .dot, #ntscToggleBtn.off .dot{
     background:#555;
     box-shadow:none;
   }
-  #fogToggleBtn.off, #interlaceToggleBtn.off, #crtToggleBtn.off, #fpsToggleBtn.off, #ledToggleBtn.off, #nesToggleBtn.off{
+  #fogToggleBtn.off, #interlaceToggleBtn.off, #crtToggleBtn.off, #fpsToggleBtn.off, #ledToggleBtn.off, #nesToggleBtn.off, #ntscToggleBtn.off{
     color:#8a8874;
   }
   #gameWrap{
@@ -276,8 +276,8 @@
   <button id="tileToggleBtn" type="button" title="Switches the background/sprite tile grid between 8x8 and 16x16, independent of resolution mode. Reloads to apply.">
     <span id="tileToggleLabel">Tile: 16px</span>
   </button>
-  <button id="stdToggleBtn" type="button" title="Switches between NTSC and PAL timing/resolution. Reloads to apply.">
-    <span id="stdToggleLabel">TV: NTSC</span>
+  <button id="ntscToggleBtn" type="button" aria-pressed="false" title="Locks the game's simulation tick to the real NES/NTSC frame rate (~60.0988 Hz) instead of whatever your display's refresh rate happens to be.">
+    <span class="dot"></span><span id="ntscToggleLabel">Rate: Display</span>
   </button>
   <button id="fpsToggleBtn" type="button" aria-pressed="false">
     <span class="dot"></span><span id="fpsToggleLabel">View: Top-Down</span>
@@ -335,39 +335,33 @@
   const canvas = document.getElementById('gameCanvas');
   const ctx = canvas.getContext('2d');
 
-  // ---------------- Video mode: resolution + TV standard ----------------
-  // Real SNES active-picture sizes. "Hi-res" mode doubles horizontal pixel
-  // density (twice the dot clock). The interlace simulation (see the
-  // "Simulated interlacing" section below) is a separate, independent
-  // toggle available at any resolution — real SNES interlace combines two
-  // fields into one double-height image regardless of horizontal mode, so
-  // it isn't hi-res-exclusive here either. NTSC/PAL differ in active scanline count
-  // (224 vs 239), which is also why PAL's tile rows don't land on a clean
-  // whole number — real PAL SNES hardware has that same half-tile-of-overscan
-  // quirk. The background/sprite tile grid (8x8 vs 16x16) is a SEPARATE,
-  // independent choice — see tileSize/TILE_SCALE below — since real SNES
-  // games mixed both tile sizes freely regardless of resolution mode.
-  // Changing resolution, TV standard, or tile size all require
-  // reinitializing the whole world (map, entities, and every texture are
-  // all baked at a fixed pixel scale tied to this), so — same as a real
-  // console — switching any of them means a reset.
+  // ---------------- Video mode: resolution ----------------
+  // Real SNES active-picture sizes, NTSC only. "Hi-res" mode doubles
+  // horizontal pixel density (twice the dot clock). The interlace
+  // simulation (see the "Simulated interlacing" section below) is a
+  // separate, independent toggle available at any resolution — real SNES
+  // interlace combines two fields into one double-height image regardless
+  // of horizontal mode, so it isn't hi-res-exclusive here either. The
+  // background/sprite tile grid (8x8 vs 16x16) is a SEPARATE, independent
+  // choice — see tileSize/TILE_SCALE below — since real SNES games mixed
+  // both tile sizes freely regardless of resolution mode. Changing
+  // resolution or tile size both require reinitializing the whole world
+  // (map, entities, and every texture are all baked at a fixed pixel scale
+  // tied to this), so — same as a real console — switching either means a
+  // reset.
   const RES_STORAGE_KEY = 'perimeter_resMode';   // 'normal' | 'hires'
-  const STD_STORAGE_KEY = 'perimeter_tvStandard'; // 'ntsc' | 'pal'
   let resMode = 'normal';
-  let tvStandard = 'ntsc';
   try{
     const savedRes = localStorage.getItem(RES_STORAGE_KEY);
     if(savedRes === 'normal' || savedRes === 'hires') resMode = savedRes;
-    const savedStd = localStorage.getItem(STD_STORAGE_KEY);
-    if(savedStd === 'ntsc' || savedStd === 'pal') tvStandard = savedStd;
-  }catch(e){ /* localStorage unavailable — default to hi-res NTSC */ }
+  }catch(e){ /* localStorage unavailable — default to normal res */ }
 
   const NATIVE_TILE = 8; // true NES/SNES background tile size, in pixels
   const RES_DIMENSIONS = {
-    normal: { ntsc: [256,224], pal: [256,239] },
-    hires:  { ntsc: [512,448], pal: [512,478] }
+    normal: [256,224],
+    hires:  [512,448]
   };
-  const [CANVAS_W, CANVAS_H] = RES_DIMENSIONS[resMode][tvStandard];
+  const [CANVAS_W, CANVAS_H] = RES_DIMENSIONS[resMode];
   canvas.width = CANVAS_W;
   canvas.height = CANVAS_H;
 
@@ -414,14 +408,45 @@
       location.reload();
     });
   }
-  const stdToggleBtn = document.getElementById('stdToggleBtn');
-  const stdToggleLabel = document.getElementById('stdToggleLabel');
-  if(stdToggleLabel) stdToggleLabel.textContent = 'TV: ' + (tvStandard==='pal' ? 'PAL' : 'NTSC');
-  if(stdToggleBtn){
-    stdToggleBtn.addEventListener('click', function(){
-      const next = (tvStandard === 'pal') ? 'ntsc' : 'pal';
-      try{ localStorage.setItem(STD_STORAGE_KEY, next); }catch(e){}
-      location.reload();
+  // ---------------- Authentic NTSC frame-rate toggle (saved in the browser) ----------------
+  // The real NES/PPU doesn't run at a flat "60fps" — its actual NTSC frame
+  // rate falls out of the hardware clocks: a 21.477272 MHz master clock
+  // divided down to a ~5.369318 MHz PPU clock, rendering 262 scanlines of
+  // 341 PPU cycles each (~89,341.5 cycles/frame, averaged over the
+  // well-known odd-frame cycle skip) — which works out to ~60.0988 Hz, not
+  // an even 60. Browsers can't be told to change the DISPLAY's physical
+  // refresh rate, but the SIMULATION's tick rate is fully ours to control:
+  // when this is on, loop() below runs a fixed-timestep accumulator that
+  // steps update() in exact 1/60.0988s increments regardless of the
+  // monitor's actual refresh rate, so the game logic advances at the same
+  // real-world rate an actual NTSC NES would, whether you're on a 60Hz,
+  // 144Hz, or 240Hz screen. Off, it just steps by real elapsed time per rAF
+  // tick like normal (i.e. matches your display's native refresh rate).
+  const NTSC_TIMING_STORAGE_KEY = 'perimeter_ntscAuthenticTiming';
+  let ntscAuthenticTiming = false;
+  try{
+    const saved = localStorage.getItem(NTSC_TIMING_STORAGE_KEY);
+    if(saved !== null) ntscAuthenticTiming = saved === '1';
+  }catch(e){ /* localStorage unavailable — default off */ }
+  const NTSC_FRAME_HZ = 60.0988; // real NES PPU NTSC frame rate
+  const NTSC_FRAME_TIME = 1 / NTSC_FRAME_HZ;
+  let ntscAccumulator = 0;
+
+  const ntscToggleBtn = document.getElementById('ntscToggleBtn');
+  const ntscToggleLabel = document.getElementById('ntscToggleLabel');
+  function refreshNtscButton(){
+    if(!ntscToggleBtn) return;
+    ntscToggleBtn.classList.toggle('off', !ntscAuthenticTiming);
+    ntscToggleBtn.setAttribute('aria-pressed', String(ntscAuthenticTiming));
+    if(ntscToggleLabel) ntscToggleLabel.textContent = 'Rate: ' + (ntscAuthenticTiming ? 'NTSC 60.0988' : 'Display');
+  }
+  refreshNtscButton();
+  if(ntscToggleBtn){
+    ntscToggleBtn.addEventListener('click', function(){
+      ntscAuthenticTiming = !ntscAuthenticTiming;
+      ntscAccumulator = 0; // don't carry over a partial step from the other mode
+      try{ localStorage.setItem(NTSC_TIMING_STORAGE_KEY, ntscAuthenticTiming ? '1' : '0'); }catch(e){}
+      refreshNtscButton();
     });
   }
 
@@ -2725,12 +2750,12 @@
   // frame (cheap — at most 16+15 tile lookups) so it can't go stale.
   function computeEdgeBlocks(){
     const sx = screenScroller.sectorX, sy = screenScroller.sectorY;
-    // Floored, not exact division: PAL's extra overscan lines (H isn't a
-    // clean multiple of TILE there — real PAL SNES hardware has the same
-    // quirk) would otherwise leave a fractional leftover row/col, which
-    // fed fractional indices into the MAP lookup below and crashed. The
-    // uncovered sliver is just overscan border either way, so it's fine
-    // for it to simply not get an edge-glow indicator.
+    // Floored, not exact division: hi-res mode's dimensions aren't always a
+    // clean multiple of TILE, which would otherwise leave a fractional
+    // leftover row/col, feeding fractional indices into the MAP lookup
+    // below and crashing. The uncovered sliver is just overscan border
+    // either way, so it's fine for it to simply not get an edge-glow
+    // indicator.
     const tilesX = Math.floor(W/TILE), tilesY = Math.floor(H/TILE);
     const col0 = sx*tilesX, col1 = col0+tilesX-1;
     const row0 = sy*tilesY, row1 = row0+tilesY-1;
@@ -4816,10 +4841,32 @@
   // ---------------- Main loop ----------------
   let last = performance.now();
   function loop(now){
-    const dt = Math.min(0.05, (now-last)/1000);
+    const dtReal = Math.min(0.05, (now-last)/1000);
     last = now;
-    if(fpsMode && addon3D){ addon3D.update(dt); addon3D.render(); }
-    else { update(dt); render(); }
+
+    const stepUpdate = (stepDt) => {
+      if(fpsMode && addon3D) addon3D.update(stepDt);
+      else update(stepDt);
+    };
+
+    if(ntscAuthenticTiming){
+      // Fixed-timestep accumulator: the simulation advances in exact
+      // 1/60.0988s slices regardless of how often rAF actually fires, so
+      // it matches real NTSC hardware timing on any display. Clamp the
+      // accumulator so a stalled/backgrounded tab doesn't dump a huge
+      // catch-up burst of updates the instant it resumes.
+      ntscAccumulator = Math.min(ntscAccumulator + dtReal, NTSC_FRAME_TIME * 4);
+      while(ntscAccumulator >= NTSC_FRAME_TIME){
+        stepUpdate(NTSC_FRAME_TIME);
+        ntscAccumulator -= NTSC_FRAME_TIME;
+      }
+    } else {
+      stepUpdate(dtReal);
+    }
+
+    if(fpsMode && addon3D) addon3D.render();
+    else render();
+
     if(nesPaletteEnabled) applyNesPalette();
     const crtActive = crtEnabled && crtReady;
     if(crtActive) drawCRTFrame();
