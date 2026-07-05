@@ -3425,6 +3425,29 @@
     return Math.abs(angleDiff(toAngle, facing)) <= ENEMY_VIEW_ARC_HALF;
   }
 
+  // This is a free-for-all, not a cops-and-robbers sim: every gunman (and
+  // every zombie) treats the player AND every other living combatant as a
+  // potential target, picking whichever one is nearest among everyone it can
+  // currently see. Same LOS + facing-cone rules as spotting the player
+  // always did — a not-yet-aware `e` still needs the candidate in front of
+  // it, but once aware, plain LOS is enough (see inFacingCone callers below).
+  // Returns {target, dist, angle} for the nearest valid candidate, or null.
+  function findNearestHostile(e, range){
+    let best = null, bestDist = range, bestAngle = 0;
+    const consider = (cand)=>{
+      if(cand !== player && !cand.alive) return;
+      const d = Math.hypot(cand.x-e.x, cand.y-e.y);
+      if(d >= bestDist) return;
+      if(!canSee(e.x, e.y, cand.x, cand.y, range)) return;
+      const angle = Math.atan2(cand.y-e.y, cand.x-e.x);
+      if(!e.aware && !inFacingCone(e.facing, angle)) return;
+      best = cand; bestDist = d; bestAngle = angle;
+    };
+    consider(player);
+    for(const o of enemies){ if(o !== e) consider(o); }
+    return best ? {target:best, dist:bestDist, angle:bestAngle} : null;
+  }
+
   // Kill-and-respawn, branched by enemy type: gunmen drop their weapon and
   // come back in a house; zombies drop nothing and come back anywhere in
   // the forest. House-interior enemies (tagged with .record by enterHouse)
@@ -4220,7 +4243,7 @@
     }
   }
 
-  function fireBullet(fromX, fromY, angle, friendly, spreadOverride, dmgOverride, spdOverride, lifeOverride, wallRetentionOverride){
+  function fireBullet(fromX, fromY, angle, friendly, spreadOverride, dmgOverride, spdOverride, lifeOverride, wallRetentionOverride, owner){
     const spread = spreadOverride!==undefined ? spreadOverride : weapon.spread;
     const a = angle + (Math.random()-0.5)*spread;
     const spd = spdOverride!==undefined ? spdOverride : weapon.bulletSpeed;
@@ -4233,6 +4256,7 @@
       wallRetention: wallRetentionOverride!==undefined ? wallRetentionOverride : weapon.wallRetention, // per-caliber wall penetration — see WALL_PENETRATION_BY_AMMO
       muzzleSpeed: spd,
       friendly,
+      owner: owner || (friendly ? player : null), // whoever fired this — never hits its own shooter, see the impact-resolution loop below
       wasInsideWall: false
     });
     // A gunshot is loud regardless of who fired it — any already-aggroed
@@ -4270,9 +4294,9 @@
   //     if there's a wall between the enemy and the source.
   const FOOTSTEP_HEAR_RANGE_ALERT = 14 * TILE;
   const FOOTSTEP_HEAR_RANGE_IDLE = 6 * TILE;
-  function alertToFootstep(x, y){
+  function alertToFootstep(x, y, source){
     for(const e of enemies){
-      if(!e.alive || !e.alertState) continue;
+      if(!e.alive || !e.alertState || e === source) continue;
       const dist = Math.hypot(e.x-x, e.y-y);
       if(e.alertState === 'investigate' || e.alertState === 'sweep'){
         if(dist > FOOTSTEP_HEAR_RANGE_ALERT) continue;
@@ -4306,7 +4330,7 @@
       : WALL_PENETRATION_RETENTION_PER_M;
     const fireAngle = targetAngle + (Math.random()-0.5)*ENEMY_AIM_ERROR;
     for(let p=0; p<pelletCount; p++){
-      fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention);
+      fireBullet(e.x, e.y, fireAngle, false, wd.spread, wd.damage, wd.bulletSpeed, wd.life, wdWallRetention, e);
     }
     emitSound(e.x, e.y, 'shot'); // gunfire is loud — always reveals exact position
     // Magazine empty — same reload downtime the player eats, no free
@@ -4334,7 +4358,7 @@
   // can share this same reaction logic without a fake bullet object.
   function enemyGotHit(e, sourceX, sourceY, bullet){
     e.aware = true;
-    e.lastSeenX = player.x; e.lastSeenY = player.y;
+    e.lastSeenX = sourceX; e.lastSeenY = sourceY;
 
     // Zombies: no fear, no gun, no decision to make — getting hurt just
     // makes them charge harder, like a wounded animal would.
@@ -4347,7 +4371,7 @@
     }
 
     const hpFrac = e.hp / e.maxHp;
-    const hadLOSAtHit = canSee(e.x, e.y, player.x, player.y, 320);
+    const hadLOSAtHit = canSee(e.x, e.y, sourceX, sourceY, 320);
 
     // Pain and fear can override aggression outright. Cowards bolt easily;
     // even a rusher can break if they're hurt badly enough. Getting hit by
@@ -4848,10 +4872,27 @@
         }
 
         const liveDmg = b.baseDmg * speedFrac * speedFrac; // kinetic energy ~ v², so damage falls off with the square of retained speed
-        if(b.friendly){
+        // Every bullet (player's or an enemy's) can land on the player or on
+        // any enemy — the only one it can never hit is whoever fired it
+        // (b.owner). This is what actually lets enemies down each other:
+        // an enemy's own shots resolve through this exact same path a
+        // player's shots do, just aimed at a different living target.
+        if(b.owner !== player && Math.hypot(b.x-player.x, b.y-player.y) < player.r){
+          let dmg = liveDmg;
+          if(player.armor > 0){
+            const absorbed = Math.min(player.armor, dmg);
+            player.armor -= absorbed;
+            dmg -= absorbed;
+          }
+          player.hp = Math.max(0, player.hp - dmg);
+          dead = true;
+          spawnImpact(b.x, b.y, 'flesh');
+          if(player.hp<=0) respawnPlayer();
+        }
+        if(!dead){
           for(let ei=0; ei<enemies.length; ei++){
             const e = enemies[ei];
-            if(!e.alive) continue;
+            if(!e.alive || e === b.owner) continue;
             if(Math.hypot(b.x-e.x, b.y-e.y) < e.r){
               e.hp -= liveDmg;
               accumulateHitNumber(e, liveDmg);
@@ -4860,36 +4901,23 @@
               if(e.hp<=0){
                 onEnemyKilled(e, ei);
               } else {
-                enemyGotShot(e, b);
+                enemyGotHit(e, b.originX, b.originY, b);
               }
               break;
             }
           }
-          // player rounds can also crack a crate open — simple AABB point test
-          // since crates are rectangular, not round
-          if(!dead){
-            for(const c of crates){
-              if(!c.alive) continue;
-              if(b.x>c.x && b.x<c.x+c.w && b.y>c.y && b.y<c.y+c.h){
-                damageCrate(c, liveDmg);
-                dead = true;
-                spawnImpact(b.x, b.y, 'wall');
-                break;
-              }
+        }
+        // player rounds can also crack a crate open — simple AABB point test
+        // since crates are rectangular, not round
+        if(!dead && b.friendly){
+          for(const c of crates){
+            if(!c.alive) continue;
+            if(b.x>c.x && b.x<c.x+c.w && b.y>c.y && b.y<c.y+c.h){
+              damageCrate(c, liveDmg);
+              dead = true;
+              spawnImpact(b.x, b.y, 'wall');
+              break;
             }
-          }
-        } else {
-          if(Math.hypot(b.x-player.x, b.y-player.y) < player.r){
-            let dmg = liveDmg;
-            if(player.armor > 0){
-              const absorbed = Math.min(player.armor, dmg);
-              player.armor -= absorbed;
-              dmg -= absorbed;
-            }
-            player.hp = Math.max(0, player.hp - dmg);
-            dead = true;
-            spawnImpact(b.x, b.y, 'flesh');
-            if(player.hp<=0) respawnPlayer();
           }
         }
       }
@@ -4934,7 +4962,6 @@
     // ---- enemy AI ----
     for(const e of enemies){
       if(!e.alive) continue;
-      const distToPlayer = Math.hypot(player.x-e.x, player.y-e.y);
       const enemyVisible = playerCanSee(e.x, e.y, VIEW_RADIUS);
       if(e.type === 'zombie'){
         // Unarmed: just closes the distance once it sees you, then swings a
@@ -4944,24 +4971,25 @@
         // facing cone though (see ENEMY_VIEW_ARC_HALF) — once already
         // aware, plain LOS is enough to keep tracking even if the player
         // circles behind them afterward.
-        const toPlayerAngle = Math.atan2(player.y-e.y, player.x-e.x);
-        const rawLOS = distToPlayer < ZOMBIE_DETECT_RANGE && canSee(e.x, e.y, player.x, player.y, ZOMBIE_DETECT_RANGE);
-        const hasLOS = rawLOS && (e.aware || inFacingCone(e.facing, toPlayerAngle));
+        const found = findNearestHostile(e, ZOMBIE_DETECT_RANGE);
+        const hasLOS = !!found;
         if(hasLOS){
+          const target = found.target;
+          const distToTarget = found.dist;
           e.aware = true;
           if(e.alertState !== 'chase'){ e.alertState = 'chase'; }
-          e.lastSeenX = player.x; e.lastSeenY = player.y;
-          const a = toPlayerAngle;
+          e.lastSeenX = target.x; e.lastSeenY = target.y;
+          const a = found.angle;
           e.facing = a;
-          const contactDist = e.r + player.r + 4;
-          e.moving = distToPlayer > contactDist;
+          const contactDist = e.r + target.r + 4;
+          e.moving = distToTarget > contactDist;
           if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
           if(e.moving){
             e.x += Math.cos(a)*e.speed*dt;
             e.y += Math.sin(a)*e.speed*dt;
           }
           e.meleeCd -= dt;
-          if(distToPlayer < ZOMBIE_MELEE.range + e.r && e.meleeCd<=0){
+          if(distToTarget < ZOMBIE_MELEE.range + e.r && e.meleeCd<=0){
             e.meleeCd = ZOMBIE_MELEE.cooldown;
             swingEffects.push({
               x: e.x, y: e.y, angle: a,
@@ -4969,13 +4997,17 @@
               timer: ZOMBIE_MELEE.swingDuration, maxTimer: ZOMBIE_MELEE.swingDuration
             });
             let dmg = ZOMBIE_MELEE.damage;
-            if(player.armor > 0){
-              const absorbed = Math.min(player.armor, dmg);
-              player.armor -= absorbed;
+            if(target.armor > 0){
+              const absorbed = Math.min(target.armor, dmg);
+              target.armor -= absorbed;
               dmg -= absorbed;
             }
-            player.hp = Math.max(0, player.hp - dmg);
-            if(player.hp<=0) respawnPlayer();
+            target.hp = Math.max(0, target.hp - dmg);
+            if(target === player){
+              if(player.hp<=0) respawnPlayer();
+            } else if(target.hp<=0){
+              onEnemyKilled(target, enemies.indexOf(target));
+            }
           }
         } else if(e.alertState === 'chase'){
           // Just lost sight of the player — instead of forgetting them
@@ -5040,9 +5072,8 @@
         // player to be somewhere in front of them — no eyes in the back of
         // the head — though once already aware they keep tracking on LOS
         // alone even if you circle around behind them afterward.
-        const toPlayerAngle = Math.atan2(player.y-e.y, player.x-e.x);
-        const rawLOS = isOnScreen(e.x, e.y, e.r) && distToPlayer < 320 && canSee(e.x, e.y, player.x, player.y, 320);
-        const enemyHasLOS = rawLOS && (e.aware || inFacingCone(e.facing, toPlayerAngle));
+        const found = isOnScreen(e.x, e.y, e.r) ? findNearestHostile(e, 320) : null;
+        const enemyHasLOS = !!found;
         const wd = e.weaponDef;
         // Reload can finish in any state (chase, investigate, sweep) — a
         // gunman shouldn't freeze mid-reload just because they lost you.
@@ -5082,8 +5113,8 @@
         } else if(enemyHasLOS){
           e.aware = true;
           e.alertState = 'chase';
-          e.lastSeenX = player.x; e.lastSeenY = player.y;
-          const a = toPlayerAngle;
+          e.lastSeenX = found.target.x; e.lastSeenY = found.target.y;
+          const a = found.angle;
           e.facing = a;
           e.moving = true;
           if(Math.abs(Math.cos(a)) > 0.01) e.facingRight = Math.cos(a) >= 0;
@@ -5091,7 +5122,7 @@
           e.y += Math.sin(a)*e.speed*e.speedMul*dt;
           if(!e.reloading){
             e.shotCd -= dt;
-            if(distToPlayer < 300 && e.shotCd<=0 && e.ammo>0){
+            if(found.dist < 300 && e.shotCd<=0 && e.ammo>0){
               // Floor the cooldown — an enemy rolling the minigun's raw 3000rpm
               // cooldown would fire dozens of times a second; clamped so "that
               // guy has a minigun" reads as dangerous, not instant death.
@@ -5194,6 +5225,12 @@
         emitSound(e.x, e.y, 'move');
         e.soundTimer = 0.55 + Math.random()*0.25;
       }
+      // Real footsteps happen whether or not the player happens to be
+      // looking — this is what lets a wandering/searching enemy get
+      // aggroed onto ANOTHER enemy's footsteps, same as it would the
+      // player's (see alertToFootstep's own call from the player's move
+      // loop). Excludes itself so an enemy never hears its own footsteps.
+      if(e.moving) alertToFootstep(e.x, e.y, e);
       if(e.type==='zombie') advanceAnim(e.anim, e.moving, dt);
       resolveObstacles(e);
     }
